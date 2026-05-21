@@ -130,48 +130,32 @@
   .session-tree::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 
   /* ── Session Tree Items ── */
-  .session-section-header {
-    padding: 6px 16px 4px; font-size: 10px; font-weight: 600;
-    text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted);
-    display: flex; align-items: center; gap: 6px;
-  }
-  .session-section-header .expand-icon {
-    width: 12px; height: 12px; cursor: pointer; transition: transform 0.15s;
-    color: var(--text-dim);
-  }
-  .session-repo-group {
-    margin: 0 0 4px 0;
-  }
-  .session-repo-header {
-    padding: 5px 16px 5px 24px; font-size: 11px; font-weight: 500;
-    color: var(--text-dim); cursor: pointer; display: flex; align-items: center;
-    gap: 6px; border-left: 2px solid transparent;
+  .session-item {
+    display: flex; flex-direction: row; align-items: center; gap: 4px;
+    padding: 5px 12px; cursor: pointer; border-left: 3px solid transparent;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
-  .session-repo-header:hover { color: var(--text); background: var(--bg-hover); }
-  .session-repo-header svg { width: 12px; height: 12px; flex-shrink: 0; }
-  .session-item {
-    display: flex; flex-direction: column; padding: 6px 16px 6px 32px;
-    cursor: pointer; border-left: 3px solid transparent; transition: none;
-  }
   .session-item:hover { background: var(--bg-hover); }
-  .session-item.active {
-    background: var(--bg-active); border-left-color: var(--accent);
+  .session-item .sess-marker {
+    font-size: 10px; color: var(--text-dim); flex-shrink: 0; width: 12px; text-align: center;
   }
   .session-item .sess-title {
     font-size: 12px; font-weight: 500; color: var(--text);
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    overflow: hidden; text-overflow: ellipsis; flex-shrink: 1; min-width: 0;
   }
   .session-item .sess-meta {
-    font-size: 10px; color: var(--text-dim); margin-top: 2px;
-    display: flex; gap: 8px; flex-wrap: wrap;
+    font-size: 10px; color: var(--text-dim); display: inline-flex; align-items: center;
+    gap: 4px; margin-left: auto; flex-shrink: 0;
   }
   .session-item .sess-meta .model-badge {
     font-family: var(--font-mono); font-size: 9px;
     padding: 1px 4px; background: var(--bg-input); border-radius: 2px;
   }
   .session-item .sess-time {
-    font-size: 10px; color: var(--text-dim); margin-top: 1px;
+    font-size: 10px; color: var(--text-dim);
+  }
+  .session-item.active {
+    background: var(--bg-active); border-left-color: var(--accent);
   }
   .session-loading, .session-empty, .session-error {
     padding: 16px; text-align: center; font-size: 11px; color: var(--text-dim);
@@ -590,7 +574,7 @@
   <!-- Panel 1: Session Sidebar -->
   <div class="panel-session" id="sessionPanel">
     <div class="panel-header">
-      <span>EXPLORER</span>
+      <span>Chats</span>
       <button onclick="toggleTheme()" title="Toggle theme">
         <svg id="themeIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
@@ -601,7 +585,7 @@
       <input type="text" id="sessionSearch" placeholder="Search sessions...">
     </div>
     <div class="session-tree" id="sessionTree">
-      <!-- Populated by JS: Hermes section, Cursor section, each with repo groups -->
+      <!-- Populated by JS: flat session list -->
     </div>
   </div>
 
@@ -630,7 +614,7 @@
         <line x1="6" y1="6" x2="6.01" y2="6"/>
         <line x1="6" y1="18" x2="6.01" y2="18"/>
       </svg>
-      <span>Select an agent to view conversation</span>
+      <span>Select an agent or session to view</span>
     </div>
   </div>
 </div>
@@ -1160,7 +1144,7 @@ async function selectAgent(id) {
 
   // Re-render agent list with active highlight
   renderAgentList(filteredAgents.length < agents.length ? filteredAgents : agents);
-  currentTab = 'overview';
+  currentTab = 'chat';
 
   var panel = document.getElementById('detailPanel');
   panel.innerHTML = '<div class="loading-detail" style="flex:1;display:flex;flex-direction:column;overflow:hidden">' +
@@ -1190,10 +1174,10 @@ async function selectAgent(id) {
 
     // Build HTML with tabs
     var headerHtml = renderOverviewContent(agent);
-    var tabBarHtml = renderTabBar('overview');
+    var tabBarHtml = renderTabBar('chat');
 
     // Overview panel
-    var overviewHtml = '<div class="tab-panel" id="overviewPanel">' +
+    var overviewHtml = '<div class="tab-panel hidden" id="overviewPanel">' +
       '<div class="overview-content">' +
       renderRunsTable(sortedRuns) +
       '</div></div>';
@@ -1210,7 +1194,7 @@ async function selectAgent(id) {
       chatConvHtml += '</div>';
     }
     var inputHtml = renderInputBar(false);
-    var chatHtml = '<div class="tab-panel hidden" id="chatPanel">' +
+    var chatHtml = '<div class="tab-panel" id="chatPanel">' +
       chatConvHtml + inputHtml +
       '</div>';
 
@@ -1265,18 +1249,6 @@ function filterAgents() {
 /* ── Session Tree ── */
 var sessions = [], filteredSessions = [], selectedSessionId = null;
 
-function extractRepoFromSession(session) {
-  if (session.model && session.model.indexOf('/') >= 0) {
-    var parts = session.model.split('/');
-    if (parts.length >= 2) return parts[0] + '/' + parts[1];
-  }
-  if (session.title) {
-    var m = session.title.match(/(?:^|\s)([a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+)(?:\s|$)/);
-    if (m) return m[1];
-  }
-  return 'default';
-}
-
 function renderSessionTree(list) {
   var el = document.getElementById('sessionTree');
   if (!list || list.length === 0) {
@@ -1284,63 +1256,42 @@ function renderSessionTree(list) {
     return;
   }
 
-  var hermesSessions = list.filter(function(s) { return (s.source || '').toLowerCase() === 'cli'; });
-  var cursorSessions = list.filter(function(s) { return (s.source || '').toLowerCase() !== 'cli'; });
+  // Sort by updatedAt DESC
+  var sorted = list.slice().sort(function(a, b) {
+    var ta = new Date(a.updatedAt || a.createdAt || 0).getTime();
+    var tb = new Date(b.updatedAt || b.createdAt || 0).getTime();
+    return tb - ta;
+  });
 
   var html = '';
+  for (var i = 0; i < sorted.length; i++) {
+    var sess = sorted[i];
+    var isActive = sess.id === selectedSessionId;
 
-  // Helper to render a section
-  function renderSection(title, sessList) {
-    if (!sessList || sessList.length === 0) return '';
-    // Group by repo
-    var groups = {};
-    for (var i = 0; i < sessList.length; i++) {
-      var repo = extractRepoFromSession(sessList[i]);
-      if (!groups[repo]) groups[repo] = [];
-      groups[repo].push(sessList[i]);
-    }
-    var repoKeys = Object.keys(groups).sort();
-    var section = '<div class="session-section-header">' +
-      '<svg class="expand-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
-        '<polyline points="9 18 15 12 9 6"></polyline>' +
-      '</svg>' +
-      title + ' <span style="font-weight:400;color:var(--text-dim)">(' + sessList.length + ')</span>' +
-    '</div>';
-    for (var r = 0; r < repoKeys.length; r++) {
-      var repoName = repoKeys[r];
-      var repoSessions = groups[repoName];
-      section += '<div class="session-repo-group">';
-      section += '<div class="session-repo-header">' +
-        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
-          '<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>' +
-        '</svg>' +
-        escapeHtml(repoName === 'default' ? 'Other' : repoName) +
-        ' <span style="font-weight:400;color:var(--text-dim);font-size:10px">(' + repoSessions.length + ')</span>' +
-      '</div>';
-      for (var s = 0; s < repoSessions.length; s++) {
-        var sess = repoSessions[s];
-        var isActive = sess.id === selectedSessionId;
-        var title = sess.title || sess.summary || sess.id.slice(0, 24);
-        var model = sess.model || '';
-        var time = timeAgo(sess.updatedAt || sess.createdAt);
-        var msgCount = sess.messageCount || sess.messages || 0;
-
-        section += '<div class="session-item' + (isActive ? ' active' : '') + '" onclick="selectSession(\'' + escapeHtml(sess.id) + '\')">';
-        section += '<div class="sess-title">' + escapeHtml(title) + '</div>';
-        section += '<div class="sess-meta">';
-        if (model) section += '<span class="model-badge">' + escapeHtml(model) + '</span>';
-        if (msgCount) section += '<span>' + msgCount + ' msgs</span>';
-        section += '</div>';
-        section += '<div class="sess-time">' + time + '</div>';
-        section += '</div>';
+    // Get display title
+    var title = sess.title || '';
+    if (!title) {
+      var msgs = sess.messages || sess.history || [];
+      if (msgs.length > 0) {
+        title = msgs[0].content || '';
       }
-      section += '</div>';
     }
-    return section;
-  }
+    if (title.length > 40) title = title.slice(0, 40) + '...';
 
-  html += renderSection('HERMES', hermesSessions);
-  html += renderSection('CURSOR AGENTS', cursorSessions);
+    var model = sess.model || '';
+    var msgCount = typeof sess.messageCount === 'number' ? sess.messageCount : 0;
+    var time = timeAgo(sess.updatedAt || sess.createdAt);
+
+    html += '<div class="session-item' + (isActive ? ' active' : '') + '" onclick="selectSession(\'' + escapeHtml(sess.id) + '\')">';
+    html += '<span class="sess-marker">\u25CB</span> ';
+    html += '<span class="sess-title">' + escapeHtml(title || 'Untitled') + '</span>';
+    html += ' <span class="sess-meta" style="display:inline;gap:4px">';
+    if (model) html += '<span class="model-badge">' + escapeHtml(model) + '</span>';
+    html += '<span style="color:var(--text-dim);font-size:10px">' + msgCount + 'msgs</span>';
+    html += '<span style="color:var(--text-dim);font-size:10px">' + time + '</span>';
+    html += '</span>';
+    html += '</div>';
+  }
 
   el.innerHTML = html || '<div class="session-empty">No sessions found</div>';
 }
@@ -1360,64 +1311,33 @@ function filterSessions() {
 /* ── Select Session ── */
 async function selectSession(id) {
   selectedSessionId = id;
-  // Clear session tree highlight
+  selectedId = null;
+  currentSendingRunId = null;
+
+  // Highlight the selected session in the tree
   renderSessionTree(filteredSessions.length < sessions.length ? filteredSessions : sessions);
 
-  // Clear agent selection highlight
+  // Clear agent selection highlight in middle panel
   var agentItems = document.querySelectorAll('#agentList .agent-item');
   for (var i = 0; i < agentItems.length; i++) {
     agentItems[i].classList.remove('active');
   }
 
-  // Update list panel title
-  document.getElementById('listTitle').textContent = 'Session Messages';
+  // Keep list panel title as "Cursor Agents" — do NOT change it
+  // Middle panel (agentListEl) is NOT touched — agents stay visible
 
-  // Show loading in middle panel
-  var agentListEl = document.getElementById('agentList');
-  agentListEl.innerHTML = '<div class="conversation-loading">' +
-    '<div class="shimmer-row"><div class="shimmer msg"></div></div>' +
-    '<div class="shimmer-row right"><div class="shimmer msg-short"></div></div>' +
-    '<div class="shimmer-row"><div class="shimmer msg-long"></div></div>' +
-    '</div>';
-
-  // Show session detail in right panel
+  // Show loading in right panel
   var detailPanel = document.getElementById('detailPanel');
   detailPanel.innerHTML = '<div class="loading-detail" style="flex:1;display:flex;flex-direction:column;overflow:hidden">' +
-    '<div class="conversation-loading">' +
-    '<div class="shimmer-row"><div class="shimmer msg"></div></div>' +
-    '</div></div>';
+    renderConversationSkeleton() + '</div>';
 
   try {
     var sessionDetail = await api('/sessions/' + encodeURIComponent(id));
 
-    // Render messages in middle panel
     var messages = sessionDetail.messages || sessionDetail.history || [];
-    var middleHtml = '';
-    if (!messages || messages.length === 0) {
-      middleHtml = '<div class="conversation-empty">' +
-        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">' +
-        '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>' +
-        '<span>No messages in this session</span></div>';
-    } else {
-      middleHtml = '<div class="conversation" id="conversation">';
-      for (var i = 0; i < messages.length; i++) {
-        var msg = messages[i];
-        var role = (msg.role || 'user').toLowerCase();
-        var content = msg.content || '';
-        middleHtml += '<div class="message-row ' + role + '">' +
-          '<div class="message-label">' + (role === 'user' ? 'You' : role === 'assistant' ? 'Agent' : 'System') + '</div>' +
-          '<div class="message-bubble markdown-rendered">' +
-            (content ? marked.parse(content) : '<em style="color:var(--text-dim)">No content</em>') +
-          '</div>' +
-          '<div class="message-meta"></div>' +
-        '</div>';
-      }
-      middleHtml += '</div>';
-    }
-    agentListEl.innerHTML = middleHtml;
 
-    // Render detail in right panel
-    var rightHtml = '<div class="chat-header">' +
+    // Build right panel: header + conversation + input bar (ACTIVE input)
+    var headerHtml = '<div class="chat-header">' +
       '<div class="status-dot" style="background:var(--accent)"></div>' +
       '<div class="info">' +
         '<span class="name">' + escapeHtml(sessionDetail.title || 'Session ' + id.slice(0, 8)) + '</span>' +
@@ -1426,35 +1346,144 @@ async function selectSession(id) {
       '</div>' +
     '</div>';
 
-    rightHtml += '<div class="overview-content" style="flex:1;overflow-y:auto">';
-
-    // Session info card
-    rightHtml += '<div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius);padding:12px 16px;margin-bottom:12px">';
-    if (sessionDetail.source) rightHtml += '<div style="margin-bottom:4px"><span style="color:var(--text-dim);font-size:10px;text-transform:uppercase">Source:</span> <span style="font-size:12px">' + escapeHtml(sessionDetail.source) + '</span></div>';
-    if (sessionDetail.model) rightHtml += '<div style="margin-bottom:4px"><span style="color:var(--text-dim);font-size:10px;text-transform:uppercase">Model:</span> <span style="font-size:12px;font-family:var(--font-mono)">' + escapeHtml(sessionDetail.model) + '</span></div>';
-    if (sessionDetail.repo) rightHtml += '<div style="margin-bottom:4px"><span style="color:var(--text-dim);font-size:10px;text-transform:uppercase">Repo:</span> <span style="font-size:12px">' + escapeHtml(sessionDetail.repo) + '</span></div>';
-    rightHtml += '<div><span style="color:var(--text-dim);font-size:10px;text-transform:uppercase">Messages:</span> <span style="font-size:12px">' + (messages.length) + '</span></div>';
-    rightHtml += '</div>';
-
-    // Summary section
-    if (sessionDetail.summary) {
-      rightHtml += '<div class="pr-section-title">Summary</div>';
-      rightHtml += '<div style="font-size:12px;color:var(--text);line-height:1.5;padding:8px 0">' +
-        escapeHtml(sessionDetail.summary) + '</div>';
+    // Conversation area
+    var convHtml;
+    if (!messages || messages.length === 0) {
+      convHtml = renderEmptyConversation();
+    } else {
+      convHtml = '<div class="conversation" id="conversation">';
+      for (var i = 0; i < messages.length; i++) {
+        var msg = messages[i];
+        var role = (msg.role || 'user').toLowerCase();
+        var content = msg.content || '';
+        convHtml += '<div class="message-row ' + role + '">' +
+          '<div class="message-label">' + (role === 'user' ? 'You' : role === 'assistant' ? 'Agent' : 'System') + '</div>' +
+          '<div class="message-bubble markdown-rendered">' +
+            (content ? marked.parse(content) : '<em style="color:var(--text-dim)">No content</em>') +
+          '</div>' +
+          '<div class="message-meta"></div>' +
+        '</div>';
+      }
+      convHtml += '</div>';
     }
 
-    rightHtml += '</div>';
-    detailPanel.innerHTML = rightHtml;
+    // Active input bar for sessions — sends via POST /sessions/{id}/chat
+    var inputHtml = '<div class="input-bar" id="inputBarContainer">' +
+      '<textarea id="chatInput" placeholder="Type a message to the session..." ' +
+        'onkeydown="onSessionInputKeydown(event)" oninput="autoResizeTextarea(this)" rows="1"></textarea>' +
+      '<button class="send-btn" id="sessionSendBtn" onclick="sendSessionMessage()" title="Send">' +
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+          '<line x1="22" y1="2" x2="11" y2="13"></line>' +
+          '<polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>' +
+        '</svg>' +
+      '</button>' +
+    '</div>';
+
+    detailPanel.innerHTML = headerHtml + convHtml + inputHtml;
+
+    // Auto-scroll to bottom
+    setTimeout(scrollToBottom, 50);
 
     // Highlight code blocks
     if (window.hljs) setTimeout(function(){ hljs.highlightAll(); }, 100);
 
   } catch(e) {
-    agentListEl.innerHTML = '<div class="conversation-error">' +
+    detailPanel.innerHTML = '<div class="conversation-error">' +
       '<span>Failed to load session</span>' +
       '<span style="font-size:11px;color:var(--text-dim)">' + escapeHtml(e.message) + '</span>' +
       '<button onclick="selectSession(\'' + escapeHtml(id) + '\')">Retry</button></div>';
-    detailPanel.innerHTML = renderConversationError(e.message);
+  }
+}
+
+/* ── Send Session Message ── */
+async function sendSessionMessage() {
+  var input = document.getElementById('chatInput');
+  var sendBtn = document.getElementById('sessionSendBtn');
+  if (!input || !sendBtn) return;
+  var prompt = input.value.trim();
+  if (!prompt || !selectedSessionId) return;
+
+  input.disabled = true;
+  sendBtn.disabled = true;
+  input.value = '';
+  input.style.height = 'auto';
+
+  var conv = document.getElementById('conversation');
+  if (!conv) {
+    input.disabled = false;
+    sendBtn.disabled = false;
+    return;
+  }
+
+  // Add optimistic user message
+  var userMsg = document.createElement('div');
+  userMsg.className = 'message-row user';
+  userMsg.innerHTML = '<div class="message-label">You</div>' +
+    '<div class="message-bubble">' + escapeHtml(prompt) + '</div>' +
+    '<div class="message-meta"></div>';
+  conv.appendChild(userMsg);
+  scrollToBottom();
+
+  // Add typing indicator
+  var typingRow = document.createElement('div');
+  typingRow.className = 'message-row agent';
+  typingRow.id = 'sessionTypingIndicator';
+  typingRow.innerHTML = '<div class="message-label">Agent</div>' +
+    '<div class="typing-indicator">' +
+      '<div class="dot"></div><div class="dot"></div><div class="dot"></div>' +
+    '</div>';
+  conv.appendChild(typingRow);
+  scrollToBottom();
+
+  try {
+    var resp = await api('/sessions/' + encodeURIComponent(selectedSessionId) + '/chat', 'POST', {
+      message: prompt
+    });
+
+    // Remove typing indicator
+    var typingEl = document.getElementById('sessionTypingIndicator');
+    if (typingEl) typingEl.remove();
+
+    // Add agent response
+    var responseContent = resp && resp.response ? resp.response : (resp && resp.message ? resp.message : '');
+    if (!responseContent && typeof resp === 'string') responseContent = resp;
+
+    var agentMsg = document.createElement('div');
+    agentMsg.className = 'message-row agent';
+    agentMsg.innerHTML = '<div class="message-label">Agent</div>' +
+      '<div class="message-bubble markdown-rendered">' +
+        (responseContent ? marked.parse(responseContent) : '<em style="color:var(--text-dim)">No response</em>') +
+      '</div>' +
+      '<div class="message-meta"></div>';
+    conv.appendChild(agentMsg);
+    scrollToBottom();
+
+    // Highlight code blocks
+    if (window.hljs) setTimeout(function(){ hljs.highlightAll(); }, 100);
+
+  } catch(e) {
+    var typingEl = document.getElementById('sessionTypingIndicator');
+    if (typingEl) typingEl.remove();
+
+    var errMsg = document.createElement('div');
+    errMsg.className = 'message-row system';
+    errMsg.innerHTML = '<div class="message-label">Error</div>' +
+      '<div class="message-bubble" style="background:var(--red);color:white">' +
+        escapeHtml(e.message || 'Failed to send message') +
+      '</div>';
+    conv.appendChild(errMsg);
+    scrollToBottom();
+  }
+
+  input.disabled = false;
+  sendBtn.disabled = false;
+  input.focus();
+}
+
+function onSessionInputKeydown(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendSessionMessage();
   }
 }
 
