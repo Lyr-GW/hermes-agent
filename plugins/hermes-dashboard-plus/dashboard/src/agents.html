@@ -66,14 +66,14 @@
 
   /* ── 3-Panel Layout ── */
   .panel-session {
-    width: 260px; min-width: 200px;
+    width: 260px; min-width: 180px;
     background: var(--bg-secondary);
     border-right: 1px solid var(--border);
     display: flex; flex-direction: column;
     overflow: hidden;
   }
   .panel-list {
-    width: 320px; min-width: 240px;
+    width: 320px; min-width: 180px;
     background: var(--bg);
     border-right: 1px solid var(--border);
     display: flex; flex-direction: column;
@@ -1605,10 +1605,67 @@ async function loadModelSelector() {
   }
 }
 
+/* ── Resize Panels ── */
+var resizeData = null;
+
+function initResize(handleId, panelId, storageKey) {
+  var handle = document.getElementById(handleId);
+  if (!handle) return;
+
+  handle.addEventListener('mousedown', function(e) {
+    e.preventDefault();
+    resizeData = {
+      panelId: panelId,
+      storageKey: storageKey,
+      startX: e.clientX,
+      startWidth: document.getElementById(panelId).offsetWidth
+    };
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    document.addEventListener('mousemove', onResizeMouseMove);
+    document.addEventListener('mouseup', onResizeMouseUp);
+  });
+}
+
+function onResizeMouseMove(e) {
+  if (!resizeData) return;
+  var panel = document.getElementById(resizeData.panelId);
+  var dx = e.clientX - resizeData.startX;
+  var newWidth = resizeData.startWidth + dx;
+  newWidth = Math.max(180, Math.min(600, newWidth));
+  panel.style.width = newWidth + 'px';
+  panel.style.flex = 'none';
+}
+
+function onResizeMouseUp() {
+  if (!resizeData) return;
+  document.body.style.cursor = '';
+  document.body.style.userSelect = '';
+  document.removeEventListener('mousemove', onResizeMouseMove);
+  document.removeEventListener('mouseup', onResizeMouseUp);
+  localStorage.setItem(resizeData.storageKey, document.getElementById(resizeData.panelId).style.width);
+  resizeData = null;
+}
+
+function restorePanelWidth(panelId, storageKey, defaultWidth) {
+  var saved = localStorage.getItem(storageKey);
+  if (saved) {
+    var panel = document.getElementById(panelId);
+    panel.style.width = saved;
+    panel.style.flex = 'none';
+  }
+}
+
 /* ── Init ── */
 async function init() {
   // Apply theme
   setTheme(getTheme());
+
+  // Initialize panel resize
+  restorePanelWidth('sessionPanel', 'panel-session-width', '260px');
+  restorePanelWidth('listPanel', 'panel-list-width', '320px');
+  initResize('handle1', 'sessionPanel', 'panel-session-width');
+  initResize('handle2', 'listPanel', 'panel-list-width');
 
   // Wire up session search
   document.getElementById('sessionSearch').oninput = filterSessions;
