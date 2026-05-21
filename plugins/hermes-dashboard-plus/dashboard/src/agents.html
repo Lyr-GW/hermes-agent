@@ -125,8 +125,19 @@
   }
 
   /* ── Theme Toggle ── */
-  .theme-toggle {
-    background: none; border: none; cursor: pointer; padding: 4px;
+  .model-select {
+    appearance: none; -webkit-appearance: none; -moz-appearance: none;
+    background: var(--bg-input); color: var(--text);
+    border: 1px solid var(--border); border-radius: var(--radius);
+    font: 11px var(--font); padding: 2px 18px 2px 6px;
+    cursor: pointer; outline: none; max-width: 130px;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8' viewBox='0 0 8 8'%3E%3Cpath fill='%23858585' d='M0 2l4 4 4-4z'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 4px center;
+    background-size: 8px;
+  }
+  .model-select:hover { border-color: var(--accent); }
+  .model-select option { background: var(--bg-secondary); color: var(--text); }
+  .theme-toggle { background: none; border: none; cursor: pointer; padding: 4px;
     color: var(--text-muted); display: flex; align-items: center; justify-content: center;
     border-radius: var(--radius); transition: color 0.2s;
   }
@@ -235,45 +246,37 @@
   .message-row.agent { align-items: flex-start; }
   .message-row.system { align-items: flex-start; }
 
-  .message-bubble {
-    max-width: 85%; padding: 8px 12px; border-radius: 8px;
-    font-size: 12.5px; line-height: 1.55; word-break: break-word;
-  }
   .message-bubble.markdown-rendered { white-space: normal; }
-  .message-bubble.markdown-rendered p { margin: 0 0 6px 0; }
-  .message-bubble.markdown-rendered p:last-child { margin-bottom: 0; }
-  .message-bubble.markdown-rendered ul, .message-bubble.markdown-rendered ol { margin: 4px 0; padding-left: 20px; }
-  .message-bubble.markdown-rendered li { margin-bottom: 2px; }
-  .message-bubble.markdown-rendered pre {
-    margin: 6px 0; padding: 8px 10px; border-radius: 4px;
-    background: #1a1a2e; overflow-x: auto; font-size: 11.5px;
-    line-height: 1.4;
+.message-bubble.markdown-rendered pre { background: #111118; border: 1px solid #333; border-radius: 4px; padding: 12px; overflow-x: auto; margin: 8px 0; }
+.message-bubble.markdown-rendered code { font-family: var(--font-mono); font-size: 11px; }
+.message-bubble.markdown-rendered p { margin: 4px 0; }
+.message-bubble.markdown-rendered ul, .message-bubble.markdown-rendered ol { margin: 4px 0; padding-left: 20px; }
+.message-bubble.markdown-rendered strong { font-weight: 600; }
+.message-bubble.markdown-rendered a { color: var(--accent); text-decoration: underline; }
+.message-bubble {
+    max-width: 85%; padding: 8px 12px; border-radius: 8px;
+    font-size: 12.5px; line-height: 1.55; white-space: pre-wrap; word-break: break-word;
   }
-  html.dark .message-bubble.markdown-rendered pre { background: #111118; }
-  .message-bubble.markdown-rendered code {
-    font-family: var(--font-mono); font-size: 11.5px;
-  }
-  .message-bubble.markdown-rendered p code,
-  .message-bubble.markdown-rendered li code {
-    background: rgba(128,128,128,0.15); padding: 1px 4px; border-radius: 3px;
-  }
-  .message-bubble.markdown-rendered pre code {
-    background: none; padding: 0; border-radius: 0;
-  }
-  .message-bubble.markdown-rendered strong { font-weight: 600; }
-  .message-bubble.markdown-rendered a { color: var(--accent); text-decoration: none; }
-  .message-bubble.markdown-rendered a:hover { text-decoration: underline; }
-  .message-bubble.markdown-rendered hr { border: none; border-top: 1px solid var(--border); margin: 6px 0; }
-  .message-bubble.markdown-rendered blockquote {
-    border-left: 3px solid var(--accent); padding-left: 8px; margin: 4px 0;
-    color: var(--text-muted);
-  }
-  .message-row.user .message-bubble {
+  .message-row.user .message-bubble.markdown-rendered { white-space: normal; }
+.message-bubble.markdown-rendered pre { background: #111118; border: 1px solid #333; border-radius: 4px; padding: 12px; overflow-x: auto; margin: 8px 0; }
+.message-bubble.markdown-rendered code { font-family: var(--font-mono); font-size: 11px; }
+.message-bubble.markdown-rendered p { margin: 4px 0; }
+.message-bubble.markdown-rendered ul, .message-bubble.markdown-rendered ol { margin: 4px 0; padding-left: 20px; }
+.message-bubble.markdown-rendered strong { font-weight: 600; }
+.message-bubble.markdown-rendered a { color: var(--accent); text-decoration: underline; }
+.message-bubble {
     background: var(--chat-user-bg); color: var(--text);
-    border-bottom-right-radius: 2px; white-space: pre-wrap;
+    border-bottom-right-radius: 2px;
   }
   .message-row.agent .message-bubble,
-  .message-row.system .message-bubble {
+  .message-row.system .message-bubble.markdown-rendered { white-space: normal; }
+.message-bubble.markdown-rendered pre { background: #111118; border: 1px solid #333; border-radius: 4px; padding: 12px; overflow-x: auto; margin: 8px 0; }
+.message-bubble.markdown-rendered code { font-family: var(--font-mono); font-size: 11px; }
+.message-bubble.markdown-rendered p { margin: 4px 0; }
+.message-bubble.markdown-rendered ul, .message-bubble.markdown-rendered ol { margin: 4px 0; padding-left: 20px; }
+.message-bubble.markdown-rendered strong { font-weight: 600; }
+.message-bubble.markdown-rendered a { color: var(--accent); text-decoration: underline; }
+.message-bubble {
     background: var(--chat-agent-bg); color: var(--text);
     border-bottom-left-radius: 2px;
   }
@@ -414,6 +417,9 @@
       <span>Cloud Agents</span>
       <div style="display:flex;align-items:center;gap:6px">
         <span class="count" id="agentCount">—</span>
+        <select class="model-select" id="modelSelect" onchange="onModelChange()" title="Select model">
+          <option value="gpt-5.3-codex">gpt-5.3-codex</option>
+        </select>
         <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()" title="Toggle theme">
           <svg id="themeIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
@@ -716,11 +722,10 @@ function formatRunMessage(run, isLast) {
 
   // Agent response
   var agentLabel = promptText ? 'Agent' : 'System';
-  var renderedResult = resultText ? marked.parse(resultText) : '<em style="color:var(--text-dim)">No response</em>';
   html += '<div class="message-row ' + (promptText ? 'agent' : 'system') + '">' +
     '<div class="message-label">' + agentLabel + '</div>' +
     '<div class="message-bubble markdown-rendered" id="msgBubble_' + escapeHtml(run.id) + '">' +
-      renderedResult +
+      (resultText ? marked.parse(resultText) : '<em style="color:var(--text-dim)">No response</em>') +
     '</div>' +
     '<div class="message-meta">' +
       '<span class="run-status-badge"><span class="dot ' + statusDotClass + '"></span>' + escapeHtml(run.status || '?') + '</span>' +
@@ -778,7 +783,7 @@ async function sendMessage() {
     var resp = await fetch(BASE + '/cursor/agents/' + encodeURIComponent(selectedId) + '/runs', {
       method: 'POST',
       headers: {'Content-Type': 'application/json', 'X-Hermes-Session-Token': getToken()},
-      body: JSON.stringify({prompt: {text: prompt}})
+      body: JSON.stringify({prompt: {text: prompt}, model: localStorage.getItem('agent-model') || 'gpt-5.3-codex'})
     });
     var data = await resp.json();
     if (data.status !== 'ok') throw new Error(data.error || 'Failed to create run');
@@ -834,7 +839,7 @@ async function sendMessage() {
             accumulatedText += content;
 
             if (streamBubble) {
-              streamBubble.innerHTML = '<div class="streaming-content">' + marked.parse(accumulatedText) + '</div><span class="streaming-cursor"></span>';
+              streamBubble.innerHTML = '<div class="streaming-content">' + escapeHtml(accumulatedText) + '</div><span class="streaming-cursor"></span>';
               scrollToBottom();
             }
           }
@@ -843,8 +848,7 @@ async function sendMessage() {
 
       // Update the bubble with final text
       if (streamBubble) {
-        streamBubble.innerHTML = accumulatedText ? marked.parse(accumulatedText) : '<em style="color:var(--text-dim)">No response</em>';
-        if (window.hljs) hljs.highlightAll();
+        streamBubble.innerHTML = accumulatedText ? escapeHtml(accumulatedText) : '<em style="color:var(--text-dim)">No response</em>';
         scrollToBottom();
       }
 
@@ -904,8 +908,9 @@ async function pollRunStatus(agentId, runId) {
           var bubble = document.getElementById('streamBubble');
           if (bubble && run.result) {
             bubble.innerHTML = marked.parse(run.result);
-            bubble.className = 'message-bubble markdown-rendered';
             if (window.hljs) hljs.highlightAll();
+    if (window.hljs) setTimeout(function(){ hljs.highlightAll(); }, 100);
+            bubble.className = 'message-bubble';
           }
 
           // Update status badge
@@ -1003,9 +1008,6 @@ async function selectAgent(id) {
 
     panel.innerHTML = headerHtml + tabBarHtml + overviewHtml + chatHtml;
 
-    // Highlight code blocks in markdown-rendered bubbles
-    if (window.hljs) hljs.highlightAll();
-
     // Auto-scroll to bottom
     setTimeout(scrollToBottom, 50);
 
@@ -1030,10 +1032,46 @@ function filterAgents() {
   renderAgentList(filteredAgents);
 }
 
+/* ── Model Selector ── */
+function onModelChange() {
+  var sel = document.getElementById('modelSelect');
+  if (sel) localStorage.setItem('agent-model', sel.value);
+}
+
+async function loadModelSelector() {
+  // Restore previously selected model
+  var saved = localStorage.getItem('agent-model');
+  try {
+    var data = await api('/cursor/models');
+    var items = (data && data.items) ? data.items : [];
+    var sel = document.getElementById('modelSelect');
+    if (sel && items.length > 0) {
+      sel.innerHTML = items.map(function(m) {
+        return '<option value="' + escapeHtml(m.id) + '">' + escapeHtml(m.displayName || m.id) + '</option>';
+      }).join('');
+      // Restore saved selection, or default to first available
+      if (saved && items.some(function(m) { return m.id === saved; })) {
+        sel.value = saved;
+      } else if (!saved) {
+        sel.value = 'gpt-5.3-codex';
+        localStorage.setItem('agent-model', 'gpt-5.3-codex');
+      } else {
+        // Saved model not found in list, use first available
+        localStorage.setItem('agent-model', sel.value);
+      }
+    }
+  } catch(e) {
+    // Models couldn't be loaded; keep default
+    if (!saved) localStorage.setItem('agent-model', 'gpt-5.3-codex');
+  }
+}
+
 /* ── Init ── */
 async function init() {
   // Apply theme
   setTheme(getTheme());
+  // Load models
+  loadModelSelector();
 
   renderSkeleton();
   try {
