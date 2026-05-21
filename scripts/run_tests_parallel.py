@@ -219,10 +219,15 @@ def _run_one_file(
     pytest_args: List[str],
     repo_root: Path,
     file_timeout: float,
-) -> Tuple[Path, int, str, dict[str, int]]:
+) -> Tuple[Path, int, str, dict[str, int], dict[str, float]]:
     """Run ``python -m pytest <file> <pytest_args>`` in a fresh subprocess.
 
-    Returns (file, returncode, captured_combined_output, summary_counts).
+    Returns (file, returncode, captured_combined_output, summary_counts, timing).
+
+    ``timing`` is a dict with keys:
+        spawn    — time from call start to Popen() returning
+        exec     — wall time spent in proc.communicate() (actual test run)
+        teardown — wall time for _kill_tree + post-exit cleanup
 
     ``summary_counts`` is the result of ``_parse_pytest_summary(output)`` —
 
@@ -247,6 +252,7 @@ def _run_one_file(
     bound a pathologically slow or hung file as a whole.
     """
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
+    t_spawn_start = time.monotonic()
     proc = subprocess.Popen(
         cmd,
         cwd=repo_root,
@@ -259,6 +265,7 @@ def _run_one_file(
         # _kill_tree handles the Windows path via taskkill /F /T.
         start_new_session=True,
     )
+    t_spawn_end = time.monotonic()
 
     # Capture the pgid NOW, before the leader can exit and be reaped.
     # Once the leader is reaped, os.getpgid(proc.pid) raises
@@ -274,6 +281,7 @@ def _run_one_file(
             # fallback will handle this case as a no-op.
             pgid = None
 
+    t_exec_start = time.monotonic()
     try:
         output, _ = proc.communicate(timeout=file_timeout)
         rc = proc.returncode
@@ -301,14 +309,24 @@ def _run_one_file(
         # well-behaved is not universal — kill the group anyway. Already-
         # dead processes are a no-op.
         _kill_tree(proc, pgid=pgid)
+    t_exec_end = time.monotonic()
 
+    t_teardown_start = time.monotonic()
     if rc == 5:
         # No tests collected — every test in the file was filtered out.
         # Treat as a pass; surface info in a slightly distinct status
         # so the operator can spot it.
         rc = 0
     summary = _parse_pytest_summary(output)
-    return file, rc, output, summary
+    t_teardown_end = time.monotonic()
+
+    timing = {
+        "spawn": t_spawn_end - t_spawn_start,
+        "exec": t_exec_end - t_exec_start,
+        "teardown": t_teardown_end - t_teardown_start,
+        "wall": t_teardown_end - t_spawn_start,
+    }
+    return file, rc, output, summary, timing
 
 
 def _parse_pytest_summary(output: str) -> dict[str, int]:
@@ -545,6 +563,7 @@ def main() -> int:
     # Capture and print on completion (out-of-order is fine — keeps the
     # terminal clean rather than interleaving N parallel pytest outputs).
     failures: List[Tuple[Path, str, Dict[str, int]]] = []
+    profile_data: Dict[Path, dict[str, float]] = {}  # file -> timing
     started = time.monotonic()
     files_done = 0
     tests_done = 0
@@ -554,11 +573,11 @@ def main() -> int:
     tests_failed = 0
     lock = threading.Lock()
 
-    def _on_done(file: Path, started_at: float, fut: "Future[Tuple[Path, int, str, dict[str, int]]]") -> None:
+    def _on_done(file: Path, started_at: float, fut: "Future[Tuple[Path, int, str, dict[str, int], dict[str, float]]]") -> None:
         nonlocal files_done, tests_done, pass_count, fail_count, tests_passed, tests_failed
         n_tests = test_counts.get(file, 0)
         try:
-            fpath, rc, output, summary = fut.result()
+            fpath, rc, output, summary, timing = fut.result()
         except Exception as exc:  # noqa: BLE001 — must always advance counter
             with lock:
                 files_done += 1
@@ -575,6 +594,7 @@ def main() -> int:
         with lock:
             files_done += 1
             tests_done += n_tests
+            profile_data[file] = timing
             # Accumulate test-level counts from parsed summary.
             tests_passed += summary.get("passed", 0)
             tests_failed += summary.get("failed", 0)
@@ -612,6 +632,47 @@ def main() -> int:
     print()
     pct = (tests_done / total_tests * 100) if total_tests else 0
     print(f"=== Summary: {len(files)} files, {tests_passed} tests passed, {tests_failed} failed ({pct:.0f}% complete) in {elapsed:.1f}s ({args.jobs} workers) ===")
+
+    # ── Profiling report ──────────────────────────────────────────────────
+    if profile_data:
+        n = len(profile_data)
+        total_spawn = sum(t["spawn"] for t in profile_data.values())
+        total_exec = sum(t["exec"] for t in profile_data.values())
+        total_teardown = sum(t["teardown"] for t in profile_data.values())
+        total_wall = sum(t["wall"] for t in profile_data.values())
+
+        print()
+        print(f"=== Profiling ({n} files, {args.jobs} workers, {elapsed:.1f}s wall) ===")
+        print(f"  Phase totals (sum-across-files):")
+        print(f"    spawn    {total_spawn:8.1f}s  ({total_spawn/total_wall*100:5.1f}% of summed wall)")
+        print(f"    exec     {total_exec:8.1f}s  ({total_exec/total_wall*100:5.1f}% of summed wall)")
+        print(f"    teardown {total_teardown:8.1f}s  ({total_teardown/total_wall*100:5.1f}% of summed wall)")
+        print(f"    wall     {total_wall:8.1f}s  (sum of per-file wall times)")
+
+        # Spawn overhead distribution
+        spawns = sorted(t["spawn"] for t in profile_data.values())
+        print(f"  Spawn latency distribution:")
+        for label, val in [("p50", spawns[int(n*0.50)]), ("p90", spawns[int(n*0.90)]), ("p99", spawns[min(int(n*0.99), n-1)]), ("max", spawns[-1])]:
+            print(f"    {label}  {val:.3f}s")
+
+        # Top 20 slowest files by wall time
+        by_wall = sorted(profile_data.items(), key=lambda kv: kv[1]["wall"], reverse=True)[:20]
+        print(f"  Top 20 slowest files (wall time):")
+        for fpath, t in by_wall:
+            rel = _format_file(fpath, repo_root)
+            nt = test_counts.get(fpath, 0)
+            print(f"    {t['wall']:7.1f}s  (spawn={t['spawn']:.2f} exec={t['exec']:.1f} teardown={t['teardown']:.2f})  {rel} ({nt} tests)")
+
+        # Files where spawn > 1s (might indicate python startup issues)
+        slow_spawn = [(f, t) for f, t in profile_data.items() if t["spawn"] > 1.0]
+        if slow_spawn:
+            slow_spawn.sort(key=lambda kv: kv[1]["spawn"], reverse=True)
+            print(f"  Files with spawn > 1s ({len(slow_spawn)}):")
+            for fpath, t in slow_spawn[:10]:
+                rel = _format_file(fpath, repo_root)
+                print(f"    spawn={t['spawn']:.2f}s  {rel}")
+
+        print()
 
     if failures:
         print()
