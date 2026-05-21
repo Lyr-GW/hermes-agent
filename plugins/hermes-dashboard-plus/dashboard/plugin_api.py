@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sqlite3
 import subprocess
 import time
 from pathlib import Path
@@ -519,6 +520,106 @@ async def stream_agent_run(agent_id: str, run_id: str):
                         "X-Accel-Buffering": "no",
                     },
                 )
+    except Exception as e:
+        return {"error": str(e), "status": "error"}
+
+
+# ── Session Management Routes ──────────────────────────────────────────────
+
+
+# 16. GET /sessions — list Hermes sessions from SQLite
+@router.get("/sessions")
+async def list_sessions():
+    try:
+        db_path = Path.home() / ".hermes" / "state.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute('''
+            SELECT id, source, model, started_at, ended_at, message_count,
+                   input_tokens, output_tokens, estimated_cost_usd, title
+            FROM sessions
+            ORDER BY started_at DESC
+            LIMIT 200
+        ''')
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        return {"status": "ok", "data": rows}
+    except Exception as e:
+        return {"error": str(e), "status": "error"}
+
+
+# 17. GET /sessions/{session_id} — session detail with messages
+@router.get("/sessions/{session_id}")
+async def get_session(session_id: str):
+    try:
+        db_path = Path.home() / ".hermes" / "state.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute('SELECT * FROM sessions WHERE id = ?', (session_id,))
+        session = dict(cur.fetchone() or {})
+        cur.execute('SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp', (session_id,))
+        messages = [dict(m) for m in cur.fetchall()]
+        conn.close()
+        return {"status": "ok", "data": {"session": session, "messages": messages}}
+    except Exception as e:
+        return {"error": str(e), "status": "error"}
+
+
+# 18. DELETE /sessions/{session_id} — delete session via Hermes CLI
+@router.delete("/sessions/{session_id}")
+async def delete_session(session_id: str):
+    try:
+        result = subprocess.run(
+            ['hermes', 'sessions', 'delete', session_id],
+            capture_output=True, text=True, timeout=15
+        )
+        return {"status": "ok", "data": {"exit_code": result.returncode, "stdout": result.stdout, "stderr": result.stderr}}
+    except Exception as e:
+        return {"error": str(e), "status": "error"}
+
+
+# 19. POST /sessions/{session_id}/chat — send message to Hermes session
+@router.post("/sessions/{session_id}/chat")
+async def chat_with_session(session_id: str, request: Request):
+    try:
+        body = await request.json()
+        message = body.get("message", "")
+        result = subprocess.run(
+            ['hermes', '-z', message, '--resume', session_id],
+            capture_output=True, text=True, timeout=120
+        )
+        return {"status": "ok", "data": {"exit_code": result.returncode, "response": result.stdout, "error": result.stderr}}
+    except Exception as e:
+        return {"error": str(e), "status": "error"}
+
+
+# ── GitHub PR Detail Route ─────────────────────────────────────────────────
+
+
+# 20. GET /github/prs/detail — detailed PR info (diff stats, commits, branch status)
+@router.get("/github/prs/detail")
+async def get_pr_detail(owner: str, repo: str, number: int):
+    try:
+        config = _load_config()
+        token = config.get("github_access_token", "")
+        headers = {"Accept": "application/vnd.github.v3+json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        async with httpx.AsyncClient(timeout=15) as client:
+            # PR detail
+            pr_resp = await client.get(f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}", headers=headers)
+            # PR files
+            files_resp = await client.get(f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/files", headers=headers)
+            # PR commits
+            commits_resp = await client.get(f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/commits", headers=headers)
+            result = {
+                "pr": pr_resp.json(),
+                "files": files_resp.json(),
+                "commits": commits_resp.json(),
+            }
+            return {"status": "ok", "data": result}
     except Exception as e:
         return {"error": str(e), "status": "error"}
 
