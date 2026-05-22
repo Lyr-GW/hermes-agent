@@ -1159,7 +1159,7 @@ function renderSessionTree(list) {
   // Render session items
   for (var i = 0; i < sorted.length; i++) {
     var item = sorted[i];
-    var isSession = !!item.messages || !!item.history || !!item.messageCount;
+    var isSession = !!item.messages || !!item.history || !!item.messageCount || !!item.message_count;
     if (!isSession) continue;
 
     var isActive = item.id === selectedSessionId;
@@ -1174,7 +1174,7 @@ function renderSessionTree(list) {
     if (title.length > 40) title = title.slice(0, 40) + '...';
 
     var model = item.model || '';
-    var msgCount = typeof item.messageCount === 'number' ? item.messageCount : 0;
+    var msgCount = typeof item.messageCount === 'number' ? item.messageCount : (typeof item.message_count === 'number' ? item.message_count : 0);
     var time = timeAgo(item.updatedAt || item.createdAt);
 
     html += '<div class="session-item' + (isActive ? ' active' : '') + '" onclick="selectSession(\'' + escapeHtml(item.id) + '\')">';
@@ -1182,7 +1182,7 @@ function renderSessionTree(list) {
     html += '<span class="sess-title">' + escapeHtml(title || 'Untitled') + '</span>';
     html += ' <span class="sess-meta" style="display:inline;gap:4px">';
     if (model) html += '<span class="model-badge">' + escapeHtml(model) + '</span>';
-    html += '<span style="color:var(--text-dim);font-size:10px">' + msgCount + 'msgs</span>';
+    html += '<span style="color:var(--text-dim);font-size:10px">' + msgCount + ' msgs</span>';
     html += '<span style="color:var(--text-dim);font-size:10px">' + time + '</span>';
     html += '</span>';
     html += '</div>';

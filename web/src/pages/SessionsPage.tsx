@@ -1,851 +1,766 @@
+import { useState, useRef, useEffect, useMemo } from "react";
 import {
-  useEffect,
-  useLayoutEffect,
-  useState,
-  useCallback,
-  useRef,
-} from "react";
-import { useNavigate } from "react-router-dom";
-import {
-  AlertTriangle,
-  CheckCircle2,
-  ChevronDown,
-  ChevronLeft,
-  ChevronRight,
-  Database,
-  MessageSquare,
   Search,
-  Trash2,
-  Clock,
-  Terminal,
-  Globe,
-  MessageCircle,
-  Hash,
-  X,
-  Play,
+  GitBranch,
+  Folder,
+  Paperclip,
+  Mic,
+  Send,
+  ChevronDown,
+  ChevronRight,
+  PanelRightOpen,
+  PanelRightClose,
+  FileCode,
 } from "lucide-react";
-import { api } from "@/lib/api";
-import type {
-  SessionInfo,
-  SessionMessage,
-  SessionSearchResult,
-  StatusResponse,
-} from "@/lib/api";
-import { timeAgo } from "@/lib/utils";
 import { Markdown } from "@/components/Markdown";
-import { PlatformsCard } from "@/components/PlatformsCard";
-import { Toast } from "@/components/Toast";
-import { Button } from "@nous-research/ui/ui/components/button";
-import { ListItem } from "@nous-research/ui/ui/components/list-item";
-import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { Badge } from "@nous-research/ui/ui/components/badge";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { DeleteConfirmDialog } from "@/components/DeleteConfirmDialog";
-import { useConfirmDelete } from "@/hooks/useConfirmDelete";
-import { Input } from "@/components/ui/input";
-import { useSystemActions } from "@/contexts/useSystemActions";
-import { useToast } from "@/hooks/useToast";
-import { useI18n } from "@/i18n";
-import { usePageHeader } from "@/contexts/usePageHeader";
-import { PluginSlot } from "@/plugins";
-import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
 
-const SOURCE_CONFIG: Record<string, { icon: typeof Terminal; color: string }> =
+/* ------------------------------------------------------------------ */
+/*  Types                                                              */
+/* ------------------------------------------------------------------ */
+
+interface ConversationItem {
+  id: string;
+  title: string;
+  branchName?: string;
+  additions: number;
+  deletions: number;
+}
+
+interface ConversationGroup {
+  repoName: string;
+  conversations: ConversationItem[];
+  collapsed?: boolean;
+}
+
+interface Message {
+  role: "user" | "assistant" | "system";
+  content: string;
+  timestamp?: string;
+  modelName?: string;
+}
+
+interface DiffFileData {
+  fileName: string;
+  additions: number;
+  deletions: number;
+  diffContent: string;
+  language?: string;
+  expanded?: boolean;
+}
+
+interface GitDiffData {
+  prNumber: number;
+  prStatus: "draft" | "open" | "merged" | "closed";
+  sourceBranch: string;
+  targetBranch: string;
+  files: DiffFileData[];
+}
+
+/* ------------------------------------------------------------------ */
+/*  Mock Data                                                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Conversations grouped by agent type (Cursor vs Hermes).
+ * Includes noise entries (Untitled, date-prefixed) for the
+ * sidebar's noise-filtering logic to demonstrate filtering.
+ */
+const MOCK_GROUPS: ConversationGroup[] = [
   {
-    cli: { icon: Terminal, color: "text-primary" },
-    telegram: { icon: MessageCircle, color: "text-[oklch(0.65_0.15_250)]" },
-    discord: { icon: Hash, color: "text-[oklch(0.65_0.15_280)]" },
-    slack: { icon: MessageSquare, color: "text-[oklch(0.7_0.15_155)]" },
-    whatsapp: { icon: Globe, color: "text-success" },
-    cron: { icon: Clock, color: "text-warning" },
-  };
+    repoName: "Cursor Agents",
+    conversations: [
+      { id: "s1", title: "Kv cache affinity issue", branchName: "cursor/kv-cache", additions: 1184, deletions: 43 },
+      { id: "s2", title: "Fix tensor shape mismatch in attention", branchName: "cursor/tensor-fix", additions: 56, deletions: 12 },
+      { id: "s3", title: "Optimize flash attention v2 kernel", branchName: "cursor/flash-attn", additions: 320, deletions: 89 },
+      { id: "noise1", title: "Untitled", additions: 0, deletions: 0 },
+      { id: "noise2", title: "20260521_auto_cleanup", additions: 5, deletions: 2 },
+    ],
+  },
+  {
+    repoName: "Hermes Agents",
+    conversations: [
+      { id: "s4", title: "Add streaming tool call support", branchName: "feat/streaming", additions: 245, deletions: 30 },
+      { id: "s5", title: "Refactor skill loading pipeline", branchName: "refactor/skills", additions: 0, deletions: 0 },
+      { id: "s6", title: "Update neovim lsp config", branchName: "dotfiles/nvim", additions: 89, deletions: 15 },
+      { id: "noise3", title: "20260522_temp_migration", additions: 0, deletions: 0 },
+    ],
+  },
+];
 
-/** Render an FTS5 snippet with highlighted matches.
- *  The backend wraps matches in >>> and <<< delimiters. */
-function SnippetHighlight({ snippet }: { snippet: string }) {
-  const parts: React.ReactNode[] = [];
-  const regex = />>>(.*?)<<</g;
-  let last = 0;
-  let match: RegExpExecArray | null;
-  let i = 0;
-  while ((match = regex.exec(snippet)) !== null) {
-    if (match.index > last) {
-      parts.push(snippet.slice(last, match.index));
-    }
-    parts.push(
-      <mark key={i++} className="bg-warning/30 text-warning px-0.5">
-        {match[1]}
-      </mark>,
-    );
-    last = regex.lastIndex;
-  }
-  if (last < snippet.length) {
-    parts.push(snippet.slice(last));
-  }
-  return (
-    <p className="mt-0.5 min-w-0 max-w-full truncate text-xs text-muted-foreground/80">
-      {parts}
-    </p>
-  );
-}
+const MOCK_USER_MSG =
+  "I'm seeing a performance regression in the kv cache after the latest merge. The throughput dropped by about 15% on H100. Can you trace where the bottleneck might be?";
 
-function ToolCallBlock({
-  toolCall,
-}: {
-  toolCall: { id: string; function: { name: string; arguments: string } };
-}) {
-  const [open, setOpen] = useState(false);
-  const { t } = useI18n();
+const MOCK_ASSISTANT_MSG = `Looking at the kv cache allocation in \`src/attention/cache.py\`, I suspect the issue is in the **page table fragmentation**. Let me trace through the allocation path:
 
-  let args = toolCall.function.arguments;
-  try {
-    args = JSON.stringify(JSON.parse(args), null, 2);
-  } catch {
-    // keep as-is
-  }
+\`\`\`python
+# src/attention/cache.py:142-168
+class PagedKVCache:
+    def allocate(self, num_tokens: int) -> List[int]:
+        # New block allocation
+        blocks_needed = ceil_div(num_tokens, BLOCK_SIZE)
+        # BUG: This doesn't account for partial blocks at the end of a sequence
+        available = self._free_list[:blocks_needed]
+        if len(available) < blocks_needed:
+            # Triggers compaction — very expensive on H100
+            self._compact()  # <-- This is the bottleneck
+        return available
+\`\`\`
 
-  return (
-    <div className="mt-2 border border-warning/20 bg-warning/5">
-      <ListItem
-        onClick={() => setOpen(!open)}
-        aria-label={`${open ? t.common.collapse : t.common.expand} tool call ${toolCall.function.name}`}
-        aria-expanded={open}
-        className="px-3 py-2 text-xs text-warning hover:bg-warning/10 hover:text-warning"
-      >
-        {open ? (
-          <ChevronDown className="h-3 w-3" />
-        ) : (
-          <ChevronRight className="h-3 w-3" />
-        )}
-        <span className="font-mono-ui font-medium">
-          {toolCall.function.name}
-        </span>
-        <span className="text-warning/50 ml-auto">{toolCall.id}</span>
-      </ListItem>
-      {open && (
-        <pre className="border-t border-warning/20 px-3 py-2 text-xs text-warning/80 overflow-x-auto whitespace-pre-wrap font-mono">
-          {args}
-        </pre>
-      )}
-    </div>
-  );
-}
+The compaction path is being triggered because the free list is fragmented. Here's the call frequency:
 
-function MessageBubble({
-  msg,
-  highlight,
-}: {
-  msg: SessionMessage;
-  highlight?: string;
-}) {
-  const { t } = useI18n();
+| Metric | Before merge | After merge | Delta |
+|--------|-------------|-------------|-------|
+| Allocs/sec | 1,240 | 1,980 | +60% |
+| Compactions/sec | 2 | 47 | **+2250%** |
+| Avg latency/alloc | 12μs | 38μs | +217% |
 
-  const ROLE_STYLES: Record<
-    string,
-    { bg: string; text: string; label: string }
-  > = {
-    user: {
-      bg: "bg-primary/10",
-      text: "text-primary",
-      label: t.sessions.roles.user,
+> **Key insight**: The new prefix caching in PR #12 allocates blocks in a pattern that fragments the free list much faster. The compaction O(n²) behavior is the culprit.
+
+**Suggested fix**: Replace the linear scan in \`_compact()\` with a segment tree, or increase \`BLOCK_SIZE\` from 64 to 256 to reduce the number of allocations.`;
+
+const MOCK_SYSTEM_MSG =
+  "[tool] search_code('src/attention/cache.py', query='compaction|free_list')\n  → Found 3 matches in 2 files\n[tool] read_file('src/attention/cache.py', lines='140-180')\n  → 40 lines returned";
+
+const MOCK_MESSAGES: Message[] = [
+  { role: "user", content: MOCK_USER_MSG, timestamp: "2 min ago" },
+  { role: "assistant", content: MOCK_ASSISTANT_MSG, timestamp: "1 min ago", modelName: "GPT-5.5 High" },
+  { role: "system", content: MOCK_SYSTEM_MSG, timestamp: "45 sec ago" },
+];
+
+const MOCK_DIFF: GitDiffData = {
+  prNumber: 12,
+  prStatus: "draft",
+  sourceBranch: "cursor/conductor-registration",
+  targetBranch: "cursor/function-call-affinity-integration",
+  files: [
+    {
+      fileName: "src/agent/core.py",
+      additions: 45,
+      deletions: 3,
+      language: "python",
+      diffContent: `@@ -142,7 +142,9 @@ class AgentCore:
+         self._register_tools()
+         self._init_context()
++        self._init_conductor_client()
+         logger.info("AgentCore initialized")
+ 
+     def process_message(self, msg):
++        if self.conductor:
++            return self.conductor.route(msg)
+         return self._default_handler(msg)`,
     },
-    assistant: {
-      bg: "bg-success/10",
-      text: "text-success",
-      label: t.sessions.roles.assistant,
+    {
+      fileName: "src/conductor/client.py",
+      additions: 120,
+      deletions: 0,
+      language: "python",
+      diffContent: `@@ -0,0 +1,120 @@
++class ConductorClient:
++    def __init__(self, endpoint: str, api_key: str):
++        self.endpoint = endpoint
++        self.session = httpx.AsyncClient(headers={
++            "Authorization": f"Bearer {api_key}"
++        })
++
++    async def route(self, message: str) -> str:
++        resp = await self.session.post(
++            f"{self.endpoint}/v1/route",
++            json={"message": message}
++        )
++        return resp.json()["response"]`,
     },
-    system: {
-      bg: "bg-muted",
-      text: "text-muted-foreground",
-      label: t.sessions.roles.system,
+    {
+      fileName: "pyproject.toml",
+      additions: 1,
+      deletions: 0,
+      language: "toml",
+      diffContent: `@@ -38,6 +38,7 @@ dependencies = [
+     "httpx>=0.27.0",
+     "pydantic>=2.0",
++    "conductor-sdk>=0.1.0",
+     "rich>=13.0",
+ ]`,
     },
-    tool: {
-      bg: "bg-warning/10",
-      text: "text-warning",
-      label: t.sessions.roles.tool,
-    },
-  };
+  ],
+};
 
-  const style = ROLE_STYLES[msg.role] ?? ROLE_STYLES.system;
-  const label = msg.tool_name
-    ? `${t.sessions.roles.tool}: ${msg.tool_name}`
-    : style.label;
+const MODELS = [
+  { id: "gpt-5.5-high", name: "GPT-5.5 High" },
+  { id: "claude-opus-4.7", name: "Claude Opus 4.7" },
+  { id: "gpt-5.5-low", name: "GPT-5.5 Low" },
+];
 
-  // Check if any search term appears as a prefix of any word in content
-  const isHit = (() => {
-    if (!highlight || !msg.content) return false;
-    const content = msg.content.toLowerCase();
-    const terms = highlight.toLowerCase().split(/\s+/).filter(Boolean);
-    return terms.some((term) => content.includes(term));
-  })();
+/* ------------------------------------------------------------------ */
+/*  Sub-components                                                     */
+/* ------------------------------------------------------------------ */
 
-  // Split search query into terms for inline highlighting
-  const highlightTerms =
-    isHit && highlight ? highlight.split(/\s+/).filter(Boolean) : undefined;
+/* ---------- Left: ConversationTree ---------- */
 
-  return (
-    <div
-      className={`${style.bg} p-3 ${isHit ? "ring-1 ring-warning/40" : ""}`}
-      data-search-hit={isHit || undefined}
-    >
-      <div className="flex items-center gap-2 mb-1">
-        <span className={`text-xs font-semibold ${style.text}`}>{label}</span>
-        {isHit && (
-          <Badge tone="warning" className="text-[9px] py-0 px-1.5">
-            {t.common.match}
-          </Badge>
-        )}
-        {msg.timestamp && (
-          <span className="text-[10px] text-muted-foreground">
-            {timeAgo(msg.timestamp)}
-          </span>
-        )}
-      </div>
-      {msg.content &&
-        (msg.role === "system" ? (
-          <div className="text-sm text-foreground whitespace-pre-wrap leading-relaxed">
-            {msg.content}
-          </div>
-        ) : (
-          <Markdown content={msg.content} highlightTerms={highlightTerms} />
-        ))}
-      {msg.tool_calls && msg.tool_calls.length > 0 && (
-        <div className="mt-1">
-          {msg.tool_calls.map((tc) => (
-            <ToolCallBlock key={tc.id} toolCall={tc} />
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-/** Message list with auto-scroll to first search hit. */
-function MessageList({
-  messages,
-  highlight,
+function ConversationTree({
+  groups,
+  selectedId,
+  onSelect,
+  loading,
 }: {
-  messages: SessionMessage[];
-  highlight?: string;
+  groups: ConversationGroup[];
+  selectedId: string | null;
+  onSelect: (id: string) => void;
+  loading?: boolean;
 }) {
-  const containerRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!highlight || !containerRef.current) return;
-    // Scroll to first hit after render
-    const timer = setTimeout(() => {
-      const hit = containerRef.current?.querySelector("[data-search-hit]");
-      if (hit) {
-        hit.scrollIntoView({ behavior: "smooth", block: "center" });
-      }
-    }, 50);
-    return () => clearTimeout(timer);
-  }, [messages, highlight]);
-
-  return (
-    <div
-      ref={containerRef}
-      className="flex flex-col gap-3 max-h-[600px] overflow-y-auto pr-2"
-    >
-      {messages.map((msg, i) => (
-        <MessageBubble key={i} msg={msg} highlight={highlight} />
-      ))}
-    </div>
-  );
-}
-
-function SessionRow({
-  session,
-  snippet,
-  searchQuery,
-  isExpanded,
-  onToggle,
-  onDelete,
-  resumeInChatEnabled,
-}: {
-  session: SessionInfo;
-  snippet?: string;
-  searchQuery?: string;
-  isExpanded: boolean;
-  onToggle: () => void;
-  onDelete: () => void;
-  resumeInChatEnabled: boolean;
-}) {
-  const [messages, setMessages] = useState<SessionMessage[] | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const { t } = useI18n();
-  const navigate = useNavigate();
-
-  useEffect(() => {
-    if (isExpanded && messages === null && !loading) {
-      setLoading(true);
-      api
-        .getSessionMessages(session.id)
-        .then((resp) => setMessages(resp.messages))
-        .catch((err) => setError(String(err)))
-        .finally(() => setLoading(false));
-    }
-  }, [isExpanded, session.id, messages, loading]);
-
-  const sourceInfo = (session.source
-    ? SOURCE_CONFIG[session.source]
-    : null) ?? { icon: Globe, color: "text-muted-foreground" };
-  const SourceIcon = sourceInfo.icon;
-  const hasTitle = session.title && session.title !== "Untitled";
-
-  return (
-    <div
-      className={`max-w-full min-w-0 overflow-hidden border transition-colors ${
-        session.is_active
-          ? "border-success/30 bg-success/[0.03]"
-          : "border-border"
-      }`}
-    >
-      <div
-        className="flex cursor-pointer items-start gap-3 p-3 transition-colors hover:bg-secondary/30"
-        onClick={onToggle}
-      >
-        <div className={`shrink-0 pt-0.5 ${sourceInfo.color}`}>
-          <SourceIcon className="h-4 w-4" />
-        </div>
-        <div className="flex min-w-0 flex-1 flex-col gap-2">
-          <div className="flex min-w-0 flex-col gap-0.5">
-            <div className="flex min-w-0 items-center gap-2">
-              <span
-                className={`min-w-0 flex-1 truncate text-sm ${hasTitle ? "font-medium" : "text-muted-foreground italic"}`}
-              >
-                {hasTitle
-                  ? session.title
-                  : session.preview
-                    ? session.preview.slice(0, 60)
-                    : t.sessions.untitledSession}
-              </span>
-              {session.is_active && (
-                <Badge tone="success" className="shrink-0 text-[10px]">
-                  <span className="mr-1 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-current" />
-                  {t.common.live}
-                </Badge>
-              )}
-            </div>
-            <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs text-muted-foreground">
-              <span className="max-w-[min(100%,12rem)] truncate sm:max-w-[180px]">
-                {(session.model ?? t.common.unknown).split("/").pop()}
-              </span>
-              <span className="text-border">&#183;</span>
-              <span className="shrink-0">
-                {session.message_count} {t.common.msgs}
-              </span>
-              {session.tool_call_count > 0 && (
-                <>
-                  <span className="text-border">&#183;</span>
-                  <span className="shrink-0">
-                    {session.tool_call_count} {t.common.tools}
-                  </span>
-                </>
-              )}
-              <span className="text-border">&#183;</span>
-              <span className="shrink-0">{timeAgo(session.last_active)}</span>
-            </div>
-          </div>
-          {snippet && <SnippetHighlight snippet={snippet} />}
-          <div className="flex flex-wrap items-center gap-2">
-            <Badge tone="outline" className="text-[10px]">
-              {session.source ?? "local"}
-            </Badge>
-            {resumeInChatEnabled && (
-              <Button
-                ghost
-                size="icon"
-                className="text-muted-foreground hover:text-success"
-                aria-label={t.sessions.resumeInChat}
-                title={t.sessions.resumeInChat}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  navigate(`/chat?resume=${encodeURIComponent(session.id)}`);
-                }}
-              >
-                <Play />
-              </Button>
-            )}
-            <Button
-              ghost
-              destructive
-              size="icon"
-              aria-label={t.sessions.deleteSession}
-              onClick={(e) => {
-                e.stopPropagation();
-                onDelete();
-              }}
-            >
-              <Trash2 />
-            </Button>
-          </div>
-        </div>
-      </div>
-
-      {isExpanded && (
-        <div className="min-w-0 border-t border-border bg-background/50 p-4">
-          {loading && (
-            <div className="flex items-center justify-center py-8">
-              <Spinner className="text-xl text-primary" />
-            </div>
-          )}
-          {error && (
-            <p className="text-sm text-destructive py-4 text-center">{error}</p>
-          )}
-          {messages && messages.length === 0 && (
-            <p className="text-sm text-muted-foreground py-4 text-center">
-              {t.sessions.noMessages}
-            </p>
-          )}
-          {messages && messages.length > 0 && (
-            <MessageList messages={messages} highlight={searchQuery} />
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-export default function SessionsPage() {
-  const [sessions, setSessions] = useState<SessionInfo[]>([]);
-  const [total, setTotal] = useState(0);
-  const [page, setPage] = useState(0);
-  const PAGE_SIZE = 20;
-  const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
-  const [expandedId, setExpandedId] = useState<string | null>(null);
-  const [searchResults, setSearchResults] = useState<
-    SessionSearchResult[] | null
-  >(null);
-  const [searching, setSearching] = useState(false);
-  const debounceRef = useRef<ReturnType<typeof setTimeout>>(null);
-  const logScrollRef = useRef<HTMLPreElement | null>(null);
-  const [status, setStatus] = useState<StatusResponse | null>(null);
-  const [overviewSessions, setOverviewSessions] = useState<SessionInfo[]>([]);
-  const { toast, showToast } = useToast();
-  const { t } = useI18n();
-  const { setAfterTitle, setEnd } = usePageHeader();
-  const { activeAction, actionStatus, dismissLog } = useSystemActions();
-  const resumeInChatEnabled = isDashboardEmbeddedChatEnabled();
+  const [collapsedRepos, setCollapsedRepos] = useState<Set<string>>(new Set());
+  const [newAgentOpen, setNewAgentOpen] = useState(false);
+  const newAgentRef = useRef<HTMLDivElement>(null);
 
-  useLayoutEffect(() => {
-    if (loading) {
-      setAfterTitle(null);
-      setEnd(null);
-      return;
-    }
-    setAfterTitle(
-      <Badge tone="secondary" className="text-xs tabular-nums">
-        {total}
-      </Badge>,
-    );
-    setEnd(
-      <div className="relative w-full min-w-0 sm:max-w-xs">
-        {searching ? (
-          <Spinner className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[0.875rem] text-primary" />
-        ) : (
-          <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
-        )}
-        <Input
-          placeholder={t.sessions.searchPlaceholder}
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          className="h-8 pr-7 pl-8 text-xs"
-        />
-        {search && (
-          <Button
-            ghost
-            size="xs"
-            className="absolute right-1.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
-            onClick={() => setSearch("")}
-            aria-label={t.common.clear}
-          >
-            <X />
-          </Button>
-        )}
-      </div>,
-    );
-    return () => {
-      setAfterTitle(null);
-      setEnd(null);
+  // Close New Agent dropdown on outside click
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (newAgentRef.current && !newAgentRef.current.contains(e.target as Node)) {
+        setNewAgentOpen(false);
+      }
     };
-  }, [
-    loading,
-    search,
-    searching,
-    setAfterTitle,
-    setEnd,
-    t.common.clear,
-    t.sessions.searchPlaceholder,
-    total,
-  ]);
-
-  const loadSessions = useCallback((p: number) => {
-    setLoading(true);
-    api
-      .getSessions(PAGE_SIZE, p * PAGE_SIZE)
-      .then((resp) => {
-        setSessions(resp.sessions);
-        setTotal(resp.total);
-      })
-      .catch(() => {})
-      .finally(() => setLoading(false));
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
   }, []);
 
-  useEffect(() => {
-    loadSessions(page);
-  }, [loadSessions, page]);
+  const toggleGroup = (repo: string) => {
+    setCollapsedRepos((prev) => {
+      const next = new Set(prev);
+      if (next.has(repo)) next.delete(repo);
+      else next.add(repo);
+      return next;
+    });
+  };
 
-  useEffect(() => {
-    const loadOverview = () => {
-      api
-        .getStatus()
-        .then(setStatus)
-        .catch(() => {});
-      api
-        .getSessions(50)
-        .then((r) => setOverviewSessions(r.sessions))
-        .catch(() => {});
-    };
-    loadOverview();
-    const id = setInterval(loadOverview, 5000);
-    return () => clearInterval(id);
-  }, []);
-
-  useEffect(() => {
-    const el = logScrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [actionStatus?.lines]);
-
-  // Debounced FTS search
-  useEffect(() => {
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-
-    if (!search.trim()) {
-      setSearchResults(null);
-      setSearching(false);
-      return;
-    }
-
-    setSearching(true);
-    debounceRef.current = setTimeout(() => {
-      api
-        .searchSessions(search.trim())
-        .then((resp) => setSearchResults(resp.results))
-        .catch(() => setSearchResults(null))
-        .finally(() => setSearching(false));
-    }, 300);
-
-    return () => {
-      if (debounceRef.current) clearTimeout(debounceRef.current);
-    };
-  }, [search]);
-
-  const sessionDelete = useConfirmDelete({
-    onDelete: useCallback(
-      async (id: string) => {
-        try {
-          await api.deleteSession(id);
-          setSessions((prev) => prev.filter((s) => s.id !== id));
-          setTotal((prev) => prev - 1);
-          if (expandedId === id) setExpandedId(null);
-          showToast(t.sessions.sessionDeleted, "success");
-        } catch {
-          showToast(t.sessions.failedToDelete, "error");
-          throw new Error("delete failed");
-        }
-      },
-      [
-        expandedId,
-        showToast,
-        t.sessions.sessionDeleted,
-        t.sessions.failedToDelete,
-      ],
-    ),
-  });
-
-  const pendingSession = sessionDelete.pendingId
-    ? sessions.find((s) => s.id === sessionDelete.pendingId)
-    : null;
-
-  // Build snippet map from search results (session_id → snippet)
-  const snippetMap = new Map<string, string>();
-  if (searchResults) {
-    for (const r of searchResults) {
-      snippetMap.set(r.session_id, r.snippet);
-    }
-  }
-
-  // When searching, filter sessions to those with FTS matches;
-  // when not searching, show all sessions
-  const filtered = searchResults
-    ? sessions.filter((s) => snippetMap.has(s.id))
-    : sessions;
-
-  const platformEntries = status
-    ? Object.entries(status.gateway_platforms ?? {})
-    : [];
-  const recentSessions = overviewSessions
-    .filter((s) => !s.is_active)
-    .slice(0, 5);
-
-  const alerts: { message: string; detail?: string }[] = [];
-  if (status) {
-    if (status.gateway_state === "startup_failed") {
-      alerts.push({
-        message: t.status.gatewayFailedToStart,
-        detail: status.gateway_exit_reason ?? undefined,
-      });
-    }
-    const failedPlatformEntries = platformEntries.filter(
-      ([, info]) => info.state === "fatal" || info.state === "disconnected",
-    );
-    for (const [name, info] of failedPlatformEntries) {
-      const stateLabel =
-        info.state === "fatal"
-          ? t.status.platformError
-          : t.status.platformDisconnected;
-      alerts.push({
-        message: `${name.charAt(0).toUpperCase() + name.slice(1)} ${stateLabel}`,
-        detail: info.error_message ?? undefined,
-      });
-    }
-  }
+  const filtered = useMemo(() => {
+    const q = search.toLowerCase().trim();
+    return groups
+      .map((g) => ({
+        ...g,
+        conversations: g.conversations.filter((c) => {
+          // Filter system noise: "Untitled" or date-prefixed titles
+          if (c.title === "Untitled") return false;
+          if (/^\d{8}_/.test(c.title)) return false;
+          // Search filter
+          if (!q) return true;
+          return (
+            c.title.toLowerCase().includes(q) ||
+            (c.branchName ?? "").toLowerCase().includes(q)
+          );
+        }),
+      }))
+      .filter((g) => g.conversations.length > 0);
+  }, [groups, search]);
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center py-24">
-        <Spinner className="text-2xl text-primary" />
+      <div className="flex flex-col gap-2 p-4 animate-pulse">
+        <div className="h-8 bg-gray-200 rounded" />
+        {[1, 2, 3, 4, 5].map((i) => (
+          <div key={i} className="h-6 bg-gray-100 rounded ml-2" />
+        ))}
       </div>
     );
   }
 
   return (
-    <div className="flex min-w-0 w-full max-w-full flex-col gap-4">
-      <PluginSlot name="sessions:top" />
-      <Toast toast={toast} />
-
-      <DeleteConfirmDialog
-        open={sessionDelete.isOpen}
-        onCancel={sessionDelete.cancel}
-        onConfirm={sessionDelete.confirm}
-        title={t.sessions.confirmDeleteTitle}
-        description={
-          pendingSession?.title && pendingSession.title !== "Untitled"
-            ? `"${pendingSession.title}" — ${t.sessions.confirmDeleteMessage}`
-            : t.sessions.confirmDeleteMessage
-        }
-        loading={sessionDelete.isDeleting}
-      />
-
-      {alerts.length > 0 && (
-        <div className="border border-destructive/30 bg-destructive/[0.06] p-4">
-          <div className="flex items-start gap-3">
-            <AlertTriangle className="h-5 w-5 text-destructive shrink-0 mt-0.5" />
-            <div className="flex flex-col gap-2 min-w-0">
-              {alerts.map((alert, i) => (
-                <div key={i}>
-                  <p className="text-sm font-medium text-destructive">
-                    {alert.message}
-                  </p>
-                  {alert.detail && (
-                    <p className="text-xs text-destructive/70 mt-0.5">
-                      {alert.detail}
-                    </p>
-                  )}
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {activeAction && (
-        <div className="border border-border bg-background-base/50">
-          <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
-            <div className="flex items-center gap-2 min-w-0">
-              {actionStatus?.running ? (
-                <Spinner className="shrink-0 text-[0.875rem] text-warning" />
-              ) : actionStatus?.exit_code === 0 ? (
-                <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-success" />
-              ) : actionStatus !== null ? (
-                <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-destructive" />
-              ) : (
-                <Spinner className="shrink-0 text-[0.875rem] text-muted-foreground" />
-              )}
-
-              <span className="text-xs font-mondwest tracking-[0.12em] truncate">
-                {activeAction === "restart"
-                  ? t.status.restartGateway
-                  : t.status.updateHermes}
-              </span>
-
-              <Badge
-                tone={
-                  actionStatus?.running
-                    ? "warning"
-                    : actionStatus?.exit_code === 0
-                      ? "success"
-                      : actionStatus
-                        ? "destructive"
-                        : "outline"
-                }
-                className="text-[10px] shrink-0"
-              >
-                {actionStatus?.running
-                  ? t.status.running
-                  : actionStatus?.exit_code === 0
-                    ? t.status.actionFinished
-                    : actionStatus
-                      ? `${t.status.actionFailed} (${actionStatus.exit_code ?? "?"})`
-                      : t.common.loading}
-              </Badge>
-            </div>
-
-            <Button
-              ghost
-              size="icon"
-              onClick={dismissLog}
-              className="shrink-0 opacity-60 hover:opacity-100"
-              aria-label={t.common.close}
-            >
-              <X />
-            </Button>
-          </div>
-
-          <pre
-            ref={logScrollRef}
-            className="max-h-72 overflow-auto px-3 py-2 font-mono-ui text-[11px] leading-relaxed whitespace-pre-wrap break-all"
+    <div className="flex flex-col h-full bg-white">
+      {/* ---- New Agent button ---- */}
+      <div className="p-3" ref={newAgentRef}>
+        <div className="relative">
+          <button
+            type="button"
+            onClick={() => setNewAgentOpen((v) => !v)}
+            className="flex w-full items-center justify-between rounded-lg bg-[#eaeaea] px-3.5 py-2 text-[13px] font-semibold text-[#1a1a1a] transition-colors hover:bg-[#e0e0e0]"
           >
-            {actionStatus?.lines && actionStatus.lines.length > 0
-              ? actionStatus.lines.join("\n")
-              : t.status.waitingForOutput}
-          </pre>
-        </div>
-      )}
+            <span>New Agent</span>
+            <ChevronDown
+              className={`h-3.5 w-3.5 text-[#666] transition-transform ${
+                newAgentOpen ? "rotate-180" : ""
+              }`}
+            />
+          </button>
 
-      {platformEntries.length > 0 && status && (
-        <PlatformsCard platforms={platformEntries} />
-      )}
-
-      {recentSessions.length > 0 && (
-        <Card className="min-w-0 max-w-full overflow-hidden">
-          <CardHeader className="min-w-0">
-            <div className="flex min-w-0 items-center gap-2">
-              <Clock className="h-5 w-5 shrink-0 text-muted-foreground" />
-              <CardTitle className="min-w-0 truncate text-base">
-                {t.status.recentSessions}
-              </CardTitle>
-            </div>
-          </CardHeader>
-
-          <CardContent className="grid min-w-0 gap-3">
-            {recentSessions.map((s) => (
-              <div
-                key={s.id}
-                className="flex min-w-0 max-w-full flex-col gap-2 border border-border p-3 sm:flex-row sm:items-center sm:justify-between"
+          {newAgentOpen && (
+            <div className="absolute left-0 right-0 z-30 mt-1 rounded-lg border border-[#e0e0e0] bg-white py-1 shadow-lg">
+              <button
+                type="button"
+                className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13px] text-[#1a1a1a] transition-colors hover:bg-[#f5f5f5]"
+                onClick={() => {
+                  console.info("[SessionsPage] New Cursor Agent");
+                  setNewAgentOpen(false);
+                }}
               >
-                <div className="flex min-w-0 flex-1 flex-col gap-1">
-                  <span className="min-w-0 truncate text-sm font-medium">
-                    {s.title ?? t.common.untitled}
-                  </span>
+                <span className="text-[#3b82f6]">✦</span>
+                New Cursor Agent
+              </button>
+              <button
+                type="button"
+                className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13px] text-[#1a1a1a] transition-colors hover:bg-[#f5f5f5]"
+                onClick={() => {
+                  console.info("[SessionsPage] New Hermes Agent");
+                  setNewAgentOpen(false);
+                }}
+              >
+                <span className="text-[#22c55e]">✦</span>
+                New Hermes Agent
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
 
-                  <span className="min-w-0 break-words text-xs text-muted-foreground">
-                    <span className="font-mono-ui">
-                      {(s.model ?? t.common.unknown).split("/").pop()}
-                    </span>{" "}
-                    · {s.message_count} {t.common.msgs} ·{" "}
-                    {timeAgo(s.last_active)}
-                  </span>
+      {/* Search */}
+      <div className="p-3 border-b border-[#e0e0e0] pt-0">
+        <div className="relative">
+          <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-[#999999]" />
+          <input
+            type="text"
+            placeholder="Search conversations..."
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            className="w-full h-8 pl-8 pr-3 text-xs border border-[#e0e0e0] rounded outline-none focus:border-[#3b82f6] transition-colors"
+          />
+        </div>
+      </div>
 
-                  {s.preview && (
-                    <p className="min-w-0 max-w-full text-xs leading-snug text-muted-foreground/70 [overflow-wrap:anywhere]">
-                      {s.preview}
-                    </p>
+      {/* Groups */}
+      <div className="flex-1 overflow-y-auto">
+        {filtered.length === 0 ? (
+          <div className="flex items-center justify-center h-full text-xs text-[#999999] px-4 text-center">
+            No conversations found.
+          </div>
+        ) : (
+          <div className="py-1">
+            {filtered.map((group) => {
+              const collapsed = collapsedRepos.has(group.repoName);
+              return (
+                <div key={group.repoName}>
+                  {/* Group header */}
+                  <button
+                    onClick={() => toggleGroup(group.repoName)}
+                    className="flex items-center gap-1.5 w-full px-3 py-2 text-xs font-semibold text-[#1a1a1a] hover:bg-[#f0f0f0] transition-colors"
+                  >
+                    {collapsed ? (
+                      <ChevronRight className="h-3 w-3 text-[#999999]" />
+                    ) : (
+                      <ChevronDown className="h-3 w-3 text-[#999999]" />
+                    )}
+                    <Folder className="h-3.5 w-3.5 text-[#666666]" />
+                    <span className="truncate">{group.repoName}</span>
+                  </button>
+
+                  {/* Conversations */}
+                  {!collapsed && (
+                    <div>
+                      {group.conversations.map((conv) => {
+                        const isSelected = selectedId === conv.id;
+                        return (
+                          <button
+                            key={conv.id}
+                            onClick={() => onSelect(conv.id)}
+                            className={`flex items-center gap-2 w-full px-3 py-1.5 text-xs transition-colors ${
+                              isSelected
+                                ? "bg-[#e8e8e8]"
+                                : "hover:bg-[#f0f0f0]"
+                            }`}
+                          >
+                            <GitBranch className="h-3.5 w-3.5 shrink-0 text-[#666666]" />
+                            <span className="truncate flex-1 text-left text-[#1a1a1a]">
+                              {conv.title}
+                            </span>
+                            <span className="shrink-0 text-[11px] space-x-1">
+                              {conv.additions > 0 && (
+                                <span className="text-[#22c55e]">
+                                  +{conv.additions}
+                                </span>
+                              )}
+                              {conv.deletions > 0 && (
+                                <span className="text-[#ef4444]">
+                                  -{conv.deletions}
+                                </span>
+                              )}
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
                   )}
                 </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
 
-                <Badge
-                  tone="outline"
-                  className="shrink-0 self-start text-[10px] sm:self-center"
-                >
-                  <Database className="mr-1 h-3 w-3" />
-                  {s.source ?? "local"}
-                </Badge>
-              </div>
-            ))}
-          </CardContent>
-        </Card>
-      )}
-
-      {filtered.length === 0 ? (
-        <div className="flex flex-col items-center justify-center py-16 text-muted-foreground">
-          <Clock className="h-8 w-8 mb-3 opacity-40" />
-          <p className="text-sm font-medium">
-            {search ? t.sessions.noMatch : t.sessions.noSessions}
-          </p>
-          {!search && (
-            <p className="text-xs mt-1 text-muted-foreground/60">
-              {t.sessions.startConversation}
-            </p>
-          )}
+      {/* User info footer */}
+      <div className="flex items-center gap-2.5 px-3 py-2.5 border-t border-[#e0e0e0]">
+        <div className="h-6 w-6 rounded-full bg-[#3b82f6] flex items-center justify-center text-white text-xs font-semibold shrink-0">
+          W
         </div>
-      ) : (
-        <>
-          <div className="flex min-w-0 flex-col gap-1.5">
-            {filtered.map((s) => (
-              <SessionRow
-                key={s.id}
-                session={s}
-                snippet={snippetMap.get(s.id)}
-                searchQuery={search || undefined}
-                isExpanded={expandedId === s.id}
-                onToggle={() =>
-                  setExpandedId((prev) => (prev === s.id ? null : s.id))
-                }
-                onDelete={() => sessionDelete.requestDelete(s.id)}
-                resumeInChatEnabled={resumeInChatEnabled}
-              />
-            ))}
+        <span className="text-xs font-medium text-[#1a1a1a]">Wei Lin</span>
+        <Badge
+          tone="secondary"
+          className="text-[10px] ml-auto bg-gray-100 text-[#666666]"
+        >
+          Ultra
+        </Badge>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Center: MessageFlow ---------- */
+
+function MessageFlow({
+  messages,
+  hasSelection,
+}: {
+  messages: Message[];
+  hasSelection: boolean;
+}) {
+  const [inputValue, setInputValue] = useState("");
+  const [selectedModel, setSelectedModel] = useState(MODELS[0]);
+  const [showModelPicker, setShowModelPicker] = useState(false);
+  const [rightPanelVisible, setRightPanelVisible] = useState(false);
+  const listRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (listRef.current) {
+      listRef.current.scrollTop = listRef.current.scrollHeight;
+    }
+  }, [messages]);
+
+  if (!hasSelection) {
+    return (
+      <div className="flex-1 flex items-center justify-center bg-[#f5f5f5]">
+        <div className="text-center">
+          <GitBranch className="h-10 w-10 mx-auto mb-3 text-[#cccccc]" />
+          <p className="text-sm text-[#999999]">
+            Select a conversation from the sidebar
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex-1 flex flex-col min-w-0 bg-white">
+      {/* Header */}
+      <div className="flex items-center gap-2 px-4 py-2 border-b border-[#e0e0e0] bg-white">
+        <Folder className="h-4 w-4 text-[#666666] shrink-0" />
+        <span className="text-xs text-[#666666] truncate">
+          lyr-gw/mindie-pymotor
+        </span>
+        <span className="text-[#cccccc] text-xs">/</span>
+        <span className="text-xs font-semibold text-[#1a1a1a] truncate">
+          Kv cache affinity issue
+        </span>
+        <button
+          onClick={() => setRightPanelVisible((v) => !v)}
+          className="ml-auto lg:hidden p-1 hover:bg-[#f0f0f0] rounded transition-colors"
+          title={rightPanelVisible ? "Hide diff panel" : "Show diff panel"}
+        >
+          {rightPanelVisible ? (
+            <PanelRightClose className="h-4 w-4 text-[#666666]" />
+          ) : (
+            <PanelRightOpen className="h-4 w-4 text-[#666666]" />
+          )}
+        </button>
+      </div>
+
+      {/* Messages */}
+      <div
+        ref={listRef}
+        className="flex-1 overflow-y-auto bg-[#f5f5f5] px-4"
+      >
+        <div className="max-w-3xl mx-auto py-4 flex flex-col gap-3">
+          {messages.map((msg, i) => (
+            <MessageBubble key={i} msg={msg} />
+          ))}
+        </div>
+      </div>
+
+      {/* Input area */}
+      <div className="border-t border-[#e0e0e0] bg-white px-4 py-3">
+        <div className="max-w-3xl mx-auto">
+          <div className="relative">
+            <input
+              type="text"
+              placeholder="Add a follow up..."
+              value={inputValue}
+              onChange={(e) => setInputValue(e.target.value)}
+              className="w-full h-10 pl-4 pr-20 text-sm border border-[#e0e0e0] rounded-lg outline-none focus:border-[#3b82f6] transition-colors bg-white text-[#1a1a1a] placeholder:text-[#999999]"
+            />
+            <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1">
+              <button className="p-1.5 hover:bg-[#f0f0f0] rounded transition-colors">
+                <Paperclip className="h-4 w-4 text-[#999999]" />
+              </button>
+              <button className="p-1.5 hover:bg-[#f0f0f0] rounded transition-colors">
+                <Mic className="h-4 w-4 text-[#999999]" />
+              </button>
+            </div>
           </div>
 
-          {!searchResults && total > PAGE_SIZE && (
-            <div className="flex items-center justify-between pt-2">
-              <span className="text-xs text-muted-foreground">
-                {page * PAGE_SIZE + 1}–{Math.min((page + 1) * PAGE_SIZE, total)}{" "}
-                {t.common.of} {total}
-              </span>
-              <div className="flex items-center gap-1">
-                <Button
-                  outlined
-                  size="icon"
-                  disabled={page === 0}
-                  onClick={() => setPage((p) => p - 1)}
-                  aria-label={t.sessions.previousPage}
-                >
-                  <ChevronLeft />
-                </Button>
-                <span className="text-xs text-muted-foreground px-2">
-                  {t.common.page} {page + 1} {t.common.of}{" "}
-                  {Math.ceil(total / PAGE_SIZE)}
-                </span>
-                <Button
-                  outlined
-                  size="icon"
-                  disabled={(page + 1) * PAGE_SIZE >= total}
-                  onClick={() => setPage((p) => p + 1)}
-                  aria-label={t.sessions.nextPage}
-                >
-                  <ChevronRight />
-                </Button>
-              </div>
+          {/* Model selector + send button */}
+          <div className="flex items-center justify-between mt-2">
+            <div className="relative">
+              <button
+                onClick={() => setShowModelPicker((v) => !v)}
+                className="flex items-center gap-1 text-xs text-[#666666] hover:text-[#1a1a1a] transition-colors"
+              >
+                <span>{selectedModel.name}</span>
+                <ChevronDown className="h-3 w-3" />
+              </button>
+              {showModelPicker && (
+                <div className="absolute bottom-full mb-1 left-0 bg-white border border-[#e0e0e0] rounded shadow-sm z-10 min-w-[140px]">
+                  {MODELS.map((m) => (
+                    <button
+                      key={m.id}
+                      onClick={() => {
+                        setSelectedModel(m);
+                        setShowModelPicker(false);
+                      }}
+                      className={`w-full text-left px-3 py-1.5 text-xs hover:bg-[#f0f0f0] transition-colors ${
+                        selectedModel.id === m.id
+                          ? "bg-[#e8e8e8] font-medium"
+                          : ""
+                      }`}
+                    >
+                      {m.name}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
-          )}
-        </>
+            <button className="h-8 w-8 bg-[#3b82f6] hover:bg-[#2563eb] rounded-lg flex items-center justify-center transition-colors">
+              <Send className="h-4 w-4 text-white" />
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Message Bubble ---------- */
+
+function MessageBubble({ msg }: { msg: Message }) {
+  if (msg.role === "system") {
+    return (
+      <div className="bg-[#f5f5f5] rounded px-2.5 py-1.5 text-[11px] font-mono text-[#666666] leading-relaxed whitespace-pre-wrap">
+        {msg.content}
+      </div>
+    );
+  }
+
+  if (msg.role === "user") {
+    return (
+      <div className="max-w-[70%] self-start">
+        <div className="bg-[#f0f0f0] rounded-lg px-3.5 py-2.5 text-sm text-[#1a1a1a] leading-relaxed">
+          <Markdown content={msg.content} />
+        </div>
+        {msg.timestamp && (
+          <div className="text-[10px] text-[#999999] mt-1 px-1">{msg.timestamp}</div>
+        )}
+      </div>
+    );
+  }
+
+  // assistant
+  return (
+    <div className="w-full">
+      {msg.modelName && (
+        <div className="text-[10px] text-[#999999] mb-1 px-1">{msg.modelName}</div>
       )}
-      <PluginSlot name="sessions:bottom" />
+      <div
+        className="bg-white rounded-lg px-3.5 py-2.5 text-sm text-[#1a1a1a] leading-relaxed"
+        style={{ borderLeft: "3px solid #3b82f6" }}
+      >
+        <Markdown content={msg.content} />
+      </div>
+      {msg.timestamp && (
+        <div className="text-[10px] text-[#999999] mt-1 px-1">{msg.timestamp}</div>
+      )}
+    </div>
+  );
+}
+
+/* ---------- Right: GitDiffPanel ---------- */
+
+function GitDiffPanel({ visible }: { visible: boolean }) {
+  const [mainTab, setMainTab] = useState<"git" | "desktop" | "terminal">("git");
+  const [subTab, setSubTab] = useState<"diff" | "review" | "commits">("diff");
+  const [expandedFiles, setExpandedFiles] = useState<Set<string>>(new Set());
+
+  const toggleFile = (name: string) => {
+    setExpandedFiles((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  };
+
+  if (!visible) return null;
+
+  const data = MOCK_DIFF;
+
+  return (
+    <div className="w-[400px] shrink-0 border-l border-[#e0e0e0] bg-white flex flex-col overflow-hidden">
+      {/* Main tabs */}
+      <div className="flex border-b border-[#e0e0e0]">
+        {(["git", "desktop", "terminal"] as const).map((tab) => (
+          <button
+            key={tab}
+            onClick={() => setMainTab(tab)}
+            className={`flex-1 text-xs font-medium py-2.5 transition-colors capitalize ${
+              mainTab === tab
+                ? "text-[#3b82f6] border-b-2 border-[#3b82f6]"
+                : "text-[#666666] hover:text-[#1a1a1a]"
+            }`}
+          >
+            {tab}
+          </button>
+        ))}
+      </div>
+
+      {/* PR Info */}
+      <div className="px-3 py-2.5 border-b border-[#e0e0e0]">
+        <div className="flex items-center gap-2 mb-1.5">
+          <span className="text-xs font-semibold text-[#1a1a1a]">#{data.prNumber}</span>
+          <Badge tone="secondary" className="text-[10px] bg-gray-100 text-[#666666]">
+            {data.prStatus.charAt(0).toUpperCase() + data.prStatus.slice(1)}
+          </Badge>
+        </div>
+        <div className="flex items-center gap-1 text-[11px] font-mono text-[#666666] truncate">
+          <span className="truncate">{data.sourceBranch}</span>
+          <span className="text-[#cccccc] shrink-0">→</span>
+          <span className="truncate">{data.targetBranch}</span>
+        </div>
+      </div>
+
+      {/* Sub tabs */}
+      <div className="flex border-b border-[#e0e0e0] bg-[#fafafa]">
+        {(["diff", "review", "commits"] as const).map((tab) => (
+          <button
+            key={tab}
+            onClick={() => setSubTab(tab)}
+            className={`px-3 py-1.5 text-[11px] font-medium transition-colors capitalize ${
+              subTab === tab
+                ? "text-[#3b82f6] border-b-2 border-[#3b82f6]"
+                : "text-[#999999] hover:text-[#666666]"
+            }`}
+          >
+            {tab}
+          </button>
+        ))}
+      </div>
+
+      {/* File list */}
+      <div className="flex-1 overflow-y-auto">
+        {data.files.map((file) => {
+          const expanded = expandedFiles.has(file.fileName);
+          return (
+            <div key={file.fileName} className="border-b border-[#e0e0e0] last:border-b-0">
+              {/* File header */}
+              <button
+                onClick={() => toggleFile(file.fileName)}
+                className="flex items-center gap-2 w-full px-3 py-2 hover:bg-[#f0f0f0] transition-colors"
+              >
+                {expanded ? (
+                  <ChevronDown className="h-3 w-3 shrink-0 text-[#999999]" />
+                ) : (
+                  <ChevronRight className="h-3 w-3 shrink-0 text-[#999999]" />
+                )}
+                <FileCode className="h-3.5 w-3.5 shrink-0 text-[#666666]" />
+                <span className="truncate text-xs text-[#1a1a1a] flex-1 text-left">
+                  {file.fileName}
+                </span>
+                <span className="shrink-0 text-[11px] space-x-1">
+                  <span className="text-[#22c55e]">+{file.additions}</span>
+                  <span className="text-[#ef4444]">-{file.deletions}</span>
+                </span>
+              </button>
+
+              {/* Diff content */}
+              {expanded && (
+                <div className="border-t border-[#e0e0e0] bg-[#fafafa]">
+                  {file.diffContent.split("\n").map((line, i) => {
+                    let bg = "bg-white";
+                    let prefix = " ";
+                    if (line.startsWith("+")) {
+                      bg = "bg-[#dcfce7]";
+                      prefix = "+";
+                    } else if (line.startsWith("-")) {
+                      bg = "bg-[#fee2e2]";
+                      prefix = "-";
+                    } else if (line.startsWith("@@")) {
+                      bg = "bg-[#eff6ff]";
+                      prefix = "";
+                    }
+                    return (
+                      <div
+                        key={i}
+                        className={`flex text-[11px] font-mono leading-relaxed ${bg}`}
+                      >
+                        <span className="w-[40px] shrink-0 text-right pr-2 text-[#999999] select-none">
+                          {i + 1}
+                        </span>
+                        <span className="flex-1 whitespace-pre px-1 text-[#1a1a1a]">
+                          {prefix}
+                          {line.startsWith("@@") ? line : line.slice(1)}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  Main Page                                                          */
+/* ------------------------------------------------------------------ */
+
+export default function SessionsPage() {
+  const [selectedId, setSelectedId] = useState<string>("s1");
+
+  const selectedMessages = useMemo(() => {
+    if (!selectedId) return [];
+    // Return mock messages for any selected conversation
+    return MOCK_MESSAGES;
+  }, [selectedId]);
+
+  return (
+    <div className="flex h-full w-full bg-[#f5f5f5]">
+      {/* Left: ConversationTree (with New Agent button) */}
+      <div className="w-[320px] shrink-0 border-r border-[#e0e0e0]">
+        <ConversationTree
+          groups={MOCK_GROUPS}
+          selectedId={selectedId}
+          onSelect={setSelectedId}
+        />
+      </div>
+
+      {/* Center: MessageFlow */}
+      <div className="flex-1 flex flex-col min-w-0">
+        <MessageFlow
+          messages={selectedMessages}
+          hasSelection={selectedId !== null}
+        />
+      </div>
+
+      {/* Right: GitDiffPanel */}
+      <div className="hidden lg:flex">
+        <GitDiffPanel visible={true} />
+      </div>
     </div>
   );
 }

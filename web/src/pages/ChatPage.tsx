@@ -1,865 +1,1009 @@
 /**
- * ChatPage — embeds `hermes --tui` inside the dashboard.
+ * ChatPage — New Agent page (Cursor IDE style).
  *
- *   <div host> (dashboard chrome)                                         .
- *     └─ <div wrapper> (rounded, dark bg, padded — the "terminal window"  .
- *         look that gives the page a distinct visual identity)            .
- *         └─ @xterm/xterm Terminal (WebGL renderer, Unicode 11 widths)    .
- *              │ onData      keystrokes → WebSocket → PTY master          .
- *              │ onResize    terminal resize → `\x1b[RESIZE:cols;rows]`   .
- *              │ write(data) PTY output bytes → VT100 parser              .
- *              ▼                                                          .
- *     WebSocket /api/pty?token=<session>                                  .
- *          ▼                                                              .
- *     FastAPI pty_ws  (hermes_cli/web_server.py)                          .
- *          ▼                                                              .
- *     POSIX PTY → `node ui-tui/dist/entry.js` → tui_gateway + AIAgent     .
+ * Replaces the legacy xterm.js terminal embed with a chat-first agent
+ * workspace: repo + branch selectors → large instruction input →
+ * model + MCPs → quick actions → recent activity feed.
+ *
+ * All sub-components live inline in this file to keep the surface small
+ * and obvious; data is mocked pending real API wiring. The parent
+ * (`App.tsx`) still mounts this component persistently and passes
+ * `isActive`, so the prop is accepted but unused.
+ *
+ * Design spec: ~/Documents/Code/hermes-dashboard/new-design/DESIGN.md
  */
 
-import { FitAddon } from "@xterm/addon-fit";
-import { Unicode11Addon } from "@xterm/addon-unicode11";
-import { WebLinksAddon } from "@xterm/addon-web-links";
-import { WebglAddon } from "@xterm/addon-webgl";
-import { Terminal } from "@xterm/xterm";
-import "@xterm/xterm/css/xterm.css";
-import { Button } from "@nous-research/ui/ui/components/button";
-import { Typography } from "@/components/NouiTypography";
-import { HERMES_BASE_PATH } from "@/lib/api";
-import { cn } from "@/lib/utils";
-import { Copy, PanelRight, X } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { createPortal } from "react-dom";
-import { useSearchParams } from "react-router-dom";
+import {
+  type ComponentType,
+  type KeyboardEvent,
+  type RefObject,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import {
+  CheckCircle2,
+  ChevronDown,
+  ChevronRight,
+  Clock,
+  FileText,
+  Folder,
+  GitBranch,
+  Image as ImageIcon,
+  Mic,
+  PlayCircle,
+  RotateCw,
+  Search,
+  XCircle,
+} from "lucide-react";
 
-import { ChatSidebar } from "@/components/ChatSidebar";
-import { usePageHeader } from "@/contexts/usePageHeader";
-import { useI18n } from "@/i18n";
-import { api } from "@/lib/api";
+import { cn } from "@/lib/utils";
 import { PluginSlot } from "@/plugins";
 
-function buildWsUrl(
-  token: string,
-  resume: string | null,
-  channel: string,
-): string {
-  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const qs = new URLSearchParams({ token, channel });
-  if (resume) qs.set("resume", resume);
-  return `${proto}//${window.location.host}${HERMES_BASE_PATH}/api/pty?${qs.toString()}`;
+// ============================================================
+// Types
+// ============================================================
+
+interface Repo {
+  id: string;
+  name: string;
+  fullName?: string;
+  defaultBranch?: string;
 }
 
-// Channel id ties this chat tab's PTY child (publisher) to its sidebar
-// (subscriber).  Generated once per mount so a tab refresh starts a fresh
-// channel — the previous PTY child terminates with the old WS, and its
-// channel auto-evicts when no subscribers remain.
-function generateChannelId(): string {
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-    return crypto.randomUUID();
+interface Model {
+  id: string;
+  name: string;
+  provider?: string;
+  isDefault?: boolean;
+}
+
+interface ConversationItem {
+  id: string;
+  title: string;
+  branchName?: string;
+  additions: number;
+  deletions: number;
+}
+
+interface AgentGroup {
+  label: string;
+  conversations: ConversationItem[];
+}
+
+type ActivityStatus = "draft" | "branch" | "running" | "completed" | "failed";
+
+interface Activity {
+  id: string;
+  status: ActivityStatus;
+  statusLabel: string;
+  title: string;
+  modelName: string;
+  repoName: string;
+  timestamp: string;
+  additions?: number;
+  deletions?: number;
+}
+
+type DataStatus = "loading" | "empty" | "error" | "ready";
+
+// ============================================================
+// Mock data — replace with real API calls in Phase 4.
+// ============================================================
+
+const MOCK_REPOS: Repo[] = [
+  {
+    id: "1",
+    name: "MindIE-PyMotor",
+    fullName: "lyr-gw/mindie-pymotor",
+    defaultBranch: "master",
+  },
+  {
+    id: "2",
+    name: "hermes-agent",
+    fullName: "NousResearch/hermes-agent",
+    defaultBranch: "main",
+  },
+  {
+    id: "3",
+    name: "hermes-dashboard",
+    fullName: "lyr-gw/hermes-dashboard",
+    defaultBranch: "main",
+  },
+];
+
+const MOCK_BRANCHES: string[] = [
+  "master",
+  "dev",
+  "feat/inference-cache",
+  "feat/cursor-redesign",
+  "hotfix/oom-batch-32",
+];
+
+const MOCK_MODELS: Model[] = [
+  { id: "opus-4.7-high", name: "Opus 4.7 High", provider: "Anthropic", isDefault: true },
+  { id: "sonnet-4.5", name: "Sonnet 4.5", provider: "Anthropic" },
+  { id: "gpt-5.5", name: "GPT-5.5", provider: "OpenAI" },
+  { id: "gemini-2.5-ultra", name: "Gemini 2.5 Ultra", provider: "Google" },
+];
+
+const MOCK_ACTIVITIES: Activity[] = [
+  {
+    id: "a1",
+    status: "branch",
+    statusLabel: "Branch",
+    title: "Fix memory leak in inference engine when batch size exceeds 32",
+    modelName: "Opus 4.7",
+    repoName: "lyr-gw/mindie-pymotor",
+    timestamp: "2 hours ago",
+    additions: 1184,
+    deletions: 43,
+  },
+  {
+    id: "a2",
+    status: "completed",
+    statusLabel: "Completed",
+    title: "Add KV cache affinity routing for multi-GPU deployment",
+    modelName: "Opus 4.7",
+    repoName: "lyr-gw/mindie-pymotor",
+    timestamp: "Yesterday",
+    additions: 489,
+    deletions: 12,
+  },
+  {
+    id: "a3",
+    status: "draft",
+    statusLabel: "Draft",
+    title: "Refactor conductor registration to support dynamic endpoints",
+    modelName: "Sonnet 4.5",
+    repoName: "lyr-gw/mindie-pymotor",
+    timestamp: "2 days ago",
+  },
+  {
+    id: "a4",
+    status: "running",
+    statusLabel: "Running",
+    title: "Implement function-call affinity benchmark suite",
+    modelName: "GPT-5.5",
+    repoName: "NousResearch/hermes-agent",
+    timestamp: "3 days ago",
+    additions: 256,
+    deletions: 8,
+  },
+  {
+    id: "a5",
+    status: "failed",
+    statusLabel: "Failed",
+    title: "Migrate legacy session store from sqlite to postgres",
+    modelName: "Opus 4.7",
+    repoName: "lyr-gw/hermes-dashboard",
+    timestamp: "5 days ago",
+  },
+];
+
+/** Mock sidebar conversations — includes noise entries for filtering demo. */
+const MOCK_AGENTS: AgentGroup[] = [
+  {
+    label: "Cursor Agents",
+    conversations: [
+      { id: "c1", title: "Fix memory leak in inference engine when batch size exceeds 32", branchName: "fix/memory-leak", additions: 1184, deletions: 43 },
+      { id: "c2", title: "Add KV cache affinity routing for multi-GPU deployment", branchName: "feat/kv-cache", additions: 489, deletions: 12 },
+      { id: "c3", title: "Refactor conductor registration to support dynamic endpoints", branchName: "cursor/conductor-registration", additions: 256, deletions: 8 },
+      { id: "c4", title: "Implement function-call affinity benchmark suite", branchName: "feat/fn-benchmark", additions: 320, deletions: 89 },
+      { id: "noise1", title: "Untitled", additions: 0, deletions: 0 },
+      { id: "noise2", title: "20260521_auto_setup", additions: 5, deletions: 2 },
+    ],
+  },
+  {
+    label: "Hermes Agents",
+    conversations: [
+      { id: "c5", title: "Optimize flash attention v2 kernel", branchName: "optim/flash-attn", additions: 320, deletions: 89 },
+      { id: "c6", title: "Migrate legacy session store from sqlite to postgres", branchName: "migrate/session-store", additions: 89, deletions: 15 },
+      { id: "noise3", title: "20260522_temp_cleanup", additions: 0, deletions: 0 },
+    ],
+  },
+];
+
+// ============================================================
+// useClickOutside — close dropdowns on outside click
+// ============================================================
+
+function useClickOutside<T extends HTMLElement>(
+  ref: RefObject<T | null>,
+  onOutside: () => void,
+) {
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) {
+        onOutside();
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [ref, onOutside]);
+}
+
+// ============================================================
+// InlineDropdown — text + ▼ trigger with menu; handles
+// loading/empty/error states so callers stay simple.
+// ============================================================
+
+interface InlineDropdownProps<T> {
+  selectedLabel: string;
+  items: T[];
+  itemKey: (item: T) => string;
+  itemLabel: (item: T) => string;
+  itemSecondary?: (item: T) => string | undefined;
+  onSelect: (item: T) => void;
+  status: DataStatus;
+  emptyText?: string;
+  errorText?: string;
+  onRetry?: () => void;
+  skeletonWidth?: number;
+  menuMinWidth?: number;
+  ariaLabel?: string;
+}
+
+function InlineDropdown<T>({
+  selectedLabel,
+  items,
+  itemKey,
+  itemLabel,
+  itemSecondary,
+  onSelect,
+  status,
+  emptyText = "No items.",
+  errorText = "Failed to load.",
+  onRetry,
+  skeletonWidth = 140,
+  menuMinWidth = 220,
+  ariaLabel,
+}: InlineDropdownProps<T>) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useClickOutside(ref, () => setOpen(false));
+
+  if (status === "loading") {
+    return (
+      <div
+        className="inline-block h-5 animate-pulse rounded bg-[#e8e8e8]"
+        style={{ width: skeletonWidth }}
+        aria-busy="true"
+        aria-label={ariaLabel ? `Loading ${ariaLabel}` : "Loading"}
+      />
+    );
   }
-  return `chat-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
-}
 
-// Colors for the terminal body.  Matches the dashboard's dark teal canvas
-// with cream foreground — we intentionally don't pick monokai or a loud
-// theme, because the TUI's skin engine already paints the content; the
-// terminal chrome just needs to sit quietly inside the dashboard.
-const TERMINAL_THEME = {
-  background: "#0d2626",
-  foreground: "#f0e6d2",
-  cursor: "#f0e6d2",
-  cursorAccent: "#0d2626",
-  selectionBackground: "#f0e6d244",
-};
-
-/**
- * CSS width for xterm font tiers.
- *
- * Prefer the terminal host's `clientWidth` — Chrome DevTools device mode often
- * keeps `window.innerWidth` at the full desktop value while the *drawn* layout
- * is phone-sized, which made us pick desktop font sizes (~14px) and look huge.
- */
-function terminalTierWidthPx(host: HTMLElement | null): number {
-  if (typeof window === "undefined") return 1280;
-  const fromHost = host?.clientWidth ?? 0;
-  if (fromHost > 2) return Math.round(fromHost);
-  const doc = document.documentElement?.clientWidth ?? 0;
-  const vv = window.visualViewport;
-  const inner = window.innerWidth;
-  const vvw = vv?.width ?? inner;
-  const layout = Math.min(inner, vvw, doc > 0 ? doc : inner);
-  return Math.max(1, Math.round(layout));
-}
-
-function terminalFontSizeForWidth(layoutWidthPx: number): number {
-  if (layoutWidthPx < 300) return 7;
-  if (layoutWidthPx < 360) return 8;
-  if (layoutWidthPx < 420) return 9;
-  if (layoutWidthPx < 520) return 10;
-  if (layoutWidthPx < 720) return 11;
-  if (layoutWidthPx < 1024) return 12;
-  return 14;
-}
-
-function terminalLineHeightForWidth(layoutWidthPx: number): number {
-  return layoutWidthPx < 1024 ? 1.02 : 1.15;
-}
-
-export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
-  const hostRef = useRef<HTMLDivElement | null>(null);
-  const termRef = useRef<Terminal | null>(null);
-  const fitRef = useRef<FitAddon | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
-  // Exposed to the main metrics-sync effect so it can refit the terminal
-  // the moment `isActive` flips back to true (display:none → display:flex
-  // collapses the host's box, so ResizeObserver never fires on return).
-  const syncMetricsRef = useRef<(() => void) | null>(null);
-  const [searchParams, setSearchParams] = useSearchParams();
-  // Lazy-init: the missing-token check happens at construction so the effect
-  // body doesn't have to setState (React 19's set-state-in-effect rule).
-  const [banner, setBanner] = useState<string | null>(() =>
-    typeof window !== "undefined" && !window.__HERMES_SESSION_TOKEN__
-      ? "Session token unavailable. Open this page through `hermes dashboard`, not directly."
-      : null,
-  );
-  const [copyState, setCopyState] = useState<"idle" | "copied">("idle");
-  const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Raw state for the mobile side-sheet + a derived value that force-
-  // closes whenever the chat tab isn't active.  The *derived* value is
-  // what side-effects (body-scroll lock, keydown listener, portal render)
-  // key on — that way switching to another tab triggers the effect's
-  // cleanup, releasing the scroll-lock on /sessions etc.  Returning to
-  // /chat re-runs the effect (derived flips back to true) and re-locks.
-  // Keying on the raw state would leak the body.overflow="hidden" across
-  // tabs because the dep wouldn't change on tab switch.
-  const [mobilePanelOpenRaw, setMobilePanelOpenRaw] = useState(false);
-  const mobilePanelOpen = isActive && mobilePanelOpenRaw;
-  const { setEnd } = usePageHeader();
-  const { t } = useI18n();
-  const closeMobilePanel = useCallback(() => setMobilePanelOpenRaw(false), []);
-  const modelToolsLabel = useMemo(
-    () => `${t.app.modelToolsSheetTitle} ${t.app.modelToolsSheetSubtitle}`,
-    [t.app.modelToolsSheetSubtitle, t.app.modelToolsSheetTitle],
-  );
-  const [portalRoot] = useState<HTMLElement | null>(() =>
-    typeof document !== "undefined" ? document.body : null,
-  );
-  const [narrow, setNarrow] = useState(() =>
-    typeof window !== "undefined"
-      ? window.matchMedia("(max-width: 1023px)").matches
-      : false,
-  );
-
-  // The dashboard keeps ChatPage mounted persistently so the PTY survives tab
-  // switches. That is great for ordinary /chat navigation, but it means query
-  // param changes do NOT remount the component. Resume-in-chat from the
-  // Sessions page relies on `/chat?resume=<id>` changing at runtime, so we must
-  // treat the current resume target as part of the PTY identity and rebuild the
-  // terminal session when it changes.
-  const resumeParam = searchParams.get("resume");
-  const channel = useMemo(() => generateChannelId(), [resumeParam]);
-
-  useEffect(() => {
-    if (!resumeParam) return;
-
-    let cancelled = false;
-
-    api
-      .getSessionLatestDescendant(resumeParam)
-      .then((res) => {
-        if (cancelled || !res.session_id || res.session_id === resumeParam) {
-          return;
-        }
-
-        const next = new URLSearchParams(searchParams);
-        next.set("resume", res.session_id);
-        setSearchParams(next, { replace: true });
-      })
-      .catch(() => {
-        // Best-effort: old servers or missing sessions should not block chat.
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [resumeParam, searchParams, setSearchParams]);
-
-  useEffect(() => {
-    const mql = window.matchMedia("(max-width: 1023px)");
-    const sync = () => setNarrow(mql.matches);
-    sync();
-    mql.addEventListener("change", sync);
-    return () => mql.removeEventListener("change", sync);
-  }, []);
-
-  useEffect(() => {
-    if (!mobilePanelOpen) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") closeMobilePanel();
-    };
-    document.addEventListener("keydown", onKey);
-    const prevOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-    return () => {
-      document.removeEventListener("keydown", onKey);
-      document.body.style.overflow = prevOverflow;
-    };
-  }, [mobilePanelOpen, closeMobilePanel]);
-
-  useEffect(() => {
-    const mql = window.matchMedia("(min-width: 1024px)");
-    const onChange = (e: MediaQueryListEvent) => {
-      if (e.matches) setMobilePanelOpenRaw(false);
-    };
-    mql.addEventListener("change", onChange);
-    return () => mql.removeEventListener("change", onChange);
-  }, []);
-
-  useEffect(() => {
-    // When hidden (non-chat tab) we must not register the header button —
-    // another page owns the header's end slot at that point.
-    if (!isActive) {
-      setEnd(null);
-      return;
-    }
-    if (!narrow) {
-      setEnd(null);
-      return;
-    }
-    setEnd(
-      <Button
-        ghost
-        onClick={() => setMobilePanelOpenRaw(true)}
-        aria-expanded={mobilePanelOpen}
-        aria-controls="chat-side-panel"
-        className={cn(
-          "shrink-0 rounded border border-current/20",
-          "px-2 py-1 text-[0.65rem] font-medium tracking-wide normal-case",
-          "text-midground/80 hover:text-midground hover:bg-midground/5",
-        )}
-      >
-        <span className="inline-flex items-center gap-1.5">
-          <PanelRight className="h-3 w-3 shrink-0" />
-          {modelToolsLabel}
-        </span>
-      </Button>,
-    );
-    return () => setEnd(null);
-  }, [isActive, narrow, mobilePanelOpen, modelToolsLabel, setEnd]);
-
-  const handleCopyLast = () => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    // Send the slash as a burst, wait long enough for Ink's tokenizer to
-    // emit a keypress event for each character (not coalesce them into a
-    // paste), then send Return as its own event.  The timing here is
-    // empirical — 100ms is safely past Node's default stdin coalescing
-    // window and well inside UI responsiveness.
-    ws.send("/copy");
-    setTimeout(() => {
-      const s = wsRef.current;
-      if (s && s.readyState === WebSocket.OPEN) s.send("\r");
-    }, 100);
-    setCopyState("copied");
-    if (copyResetRef.current) clearTimeout(copyResetRef.current);
-    copyResetRef.current = setTimeout(() => setCopyState("idle"), 1500);
-    termRef.current?.focus();
-  };
-
-  useEffect(() => {
-    const host = hostRef.current;
-    if (!host) return;
-
-    const token = window.__HERMES_SESSION_TOKEN__;
-    // Banner already initialised above; just bail before wiring xterm/WS.
-    if (!token) {
-      return;
-    }
-
-    const tierW0 = terminalTierWidthPx(host);
-    const term = new Terminal({
-      allowProposedApi: true,
-      cursorBlink: true,
-      fontFamily:
-        "'JetBrains Mono', 'Cascadia Mono', 'Fira Code', 'MesloLGS NF', 'Source Code Pro', Menlo, Consolas, 'DejaVu Sans Mono', monospace",
-      fontSize: terminalFontSizeForWidth(tierW0),
-      lineHeight: terminalLineHeightForWidth(tierW0),
-      letterSpacing: 0,
-      fontWeight: "400",
-      fontWeightBold: "700",
-      macOptionIsMeta: true,
-      // Hold Option (Alt on Linux/Windows) to force native text selection
-      // even when the inner Hermes TUI has enabled xterm mouse-events
-      // mode (CSI ?1000h family). Without this, click-and-drag in the
-      // chat canvas selects nothing and Cmd+C falls back to copying the
-      // entire visible buffer, which is rarely what the user wants.
-      // See #25720.
-      macOptionClickForcesSelection: true,
-      // Right-click selects the word under the pointer. xterm.js default
-      // is false; enabling it gives users a single-action selection
-      // path on top of the modifier-based bypass above.
-      rightClickSelectsWord: true,
-      // Browser-embedded chat runs the TUI in inline mode. Keep transcript
-      // history in xterm.js so the browser wheel can scroll it directly.
-      scrollback: 5000,
-      theme: TERMINAL_THEME,
-    });
-    termRef.current = term;
-
-    // --- Clipboard integration ---------------------------------------
-    //
-    // Three independent paths all route to the system clipboard:
-    //
-    //   1. **Selection → Ctrl+C (or Cmd+C on macOS).**  Ink's own handler
-    //      in useInputHandlers.ts turns Ctrl+C into a copy when the
-    //      terminal has a selection, then emits an OSC 52 escape.  Our
-    //      OSC 52 handler below decodes that escape and writes to the
-    //      browser clipboard — so the flow works just like it does in
-    //      `hermes --tui`.
-    //
-    //   2. **Ctrl/Cmd+Shift+C.**  Belt-and-suspenders shortcut that
-    //      operates directly on xterm's selection, useful if the TUI
-    //      ever stops listening (e.g. overlays / pickers) or if the user
-    //      has selected with the mouse outside of Ink's selection model.
-    //
-    //   3. **Ctrl/Cmd+Shift+V.**  Reads the system clipboard and feeds
-    //      it to the terminal as keyboard input.  xterm's paste() wraps
-    //      it with bracketed-paste if the host has that mode enabled.
-    //
-    // OSC 52 reads (terminal asking to read the clipboard) are not
-    // supported — that would let any content the TUI renders exfiltrate
-    // the user's clipboard.
-    term.parser.registerOscHandler(52, (data) => {
-      // Format: "<targets>;<base64 | '?'>"
-      const semi = data.indexOf(";");
-      if (semi < 0) return false;
-      const payload = data.slice(semi + 1);
-      if (payload === "?" || payload === "") return false; // read/clear — ignore
-      try {
-        const binary = atob(payload);
-        const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
-        const text = new TextDecoder("utf-8").decode(bytes);
-        navigator.clipboard.writeText(text).catch((err) => {
-          // Most common reason: the Clipboard API requires a user gesture.
-          // This can fail when the OSC 52 response arrives outside the
-          // original keydown event's activation. Log to aid debugging.
-          console.warn("[dashboard clipboard] OSC 52 write failed:", err.message);
-        });
-      } catch {
-        console.warn("[dashboard clipboard] malformed OSC 52 payload");
-      }
-      return true;
-    });
-
-    const isMac =
-      typeof navigator !== "undefined" && /Mac/i.test(navigator.platform);
-
-    term.attachCustomKeyEventHandler((ev) => {
-      if (ev.type !== "keydown") return true;
-
-      // Copy: Cmd+C on macOS, Ctrl+Shift+C on other platforms. Bare Ctrl+C
-      // is reserved for SIGINT to the TUI child — matches xterm / gnome-terminal /
-      // konsole / Windows Terminal. Ctrl+Shift+C only copies if a selection exists;
-      // without a selection it passes through to the TUI so agents can still
-      // react to the keypress.
-      // Paste: Cmd+Shift+V on macOS, Ctrl+Shift+V on others.
-      const copyModifier = isMac ? ev.metaKey : ev.ctrlKey && ev.shiftKey;
-      const pasteModifier = isMac ? ev.metaKey : ev.ctrlKey && ev.shiftKey;
-
-      if (copyModifier && ev.key.toLowerCase() === "c") {
-        const sel = term.getSelection();
-        if (sel) {
-          // Direct writeText inside the keydown handler preserves the user
-          // gesture — async round-trips through OSC 52 can lose activation
-          // and fail with "Document is not focused".
-          navigator.clipboard.writeText(sel).catch((err) => {
-            console.warn("[dashboard clipboard] direct copy failed:", err.message);
-          });
-          // Clear xterm.js's highlight after copy (matches gnome-terminal).
-          term.clearSelection();
-          ev.preventDefault();
-          return false;
-        }
-        // No selection → fall through so the TUI receives Ctrl+Shift+C
-        // (or the bare ev if the user used a different modifier).
-      }
-
-      if (pasteModifier && ev.key.toLowerCase() === "v") {
-        navigator.clipboard
-          .readText()
-          .then((text) => {
-            if (text) term.paste(text);
-          })
-          .catch((err) => {
-            console.warn("[dashboard clipboard] paste failed:", err.message);
-          });
-        ev.preventDefault();
-        return false;
-      }
-
-      return true;
-    });
-
-    const fit = new FitAddon();
-    fitRef.current = fit;
-    term.loadAddon(fit);
-
-    // Dashboard chat should scroll the browser-side transcript, not send
-    // mouse-wheel protocol bytes through the PTY.
-    term.attachCustomWheelEventHandler((ev) => {
-      const delta = ev.deltaY;
-      if (!delta) {
-        return false;
-      }
-
-      const step = Math.max(1, Math.round(Math.abs(delta) / 50));
-      term.scrollLines(delta > 0 ? step : -step);
-
-      ev.preventDefault();
-      ev.stopPropagation();
-      return false;
-    });
-
-    const unicode11 = new Unicode11Addon();
-    term.loadAddon(unicode11);
-    term.unicode.activeVersion = "11";
-
-    term.loadAddon(new WebLinksAddon());
-
-    term.open(host);
-
-    // WebGL draws from a texture atlas sized with device pixels. On phones and
-    // in DevTools device mode that often produces *visually* much larger cells
-    // than `fontSize` suggests — users see "huge" text even at 7–9px settings.
-    // The canvas/DOM renderer tracks `fontSize` faithfully; use it for narrow
-    // hosts.  Wide layouts still get WebGL for crisp box-drawing.
-    const useWebgl = terminalTierWidthPx(host) >= 768;
-    if (useWebgl) {
-      try {
-        const webgl = new WebglAddon();
-        webgl.onContextLoss(() => webgl.dispose());
-        term.loadAddon(webgl);
-      } catch (err) {
-        console.warn(
-          "[hermes-chat] WebGL renderer unavailable; falling back to default",
-          err,
-        );
-      }
-    }
-
-    // Initial fit + resize observer.  fit.fit() reads the container's
-    // current bounding box and resizes the terminal grid to match.
-    //
-    // The subtle bit: the dashboard has CSS transitions on the container
-    // (backdrop fade-in, rounded corners settling as fonts load).  If we
-    // call fit() at mount time, the bounding box we measure is often 1-2
-    // cell widths off from the final size.  ResizeObserver *does* fire
-    // when the container settles, but if the pixel delta happens to be
-    // smaller than one cell's width, fit() computes the same integer
-    // (cols, rows) as before and doesn't emit onResize — so the PTY
-    // never learns the final size.  Users see truncated long lines until
-    // they resize the browser window.
-    //
-    // We force one extra fit + explicit RESIZE send after two animation
-    // frames.  rAF→rAF guarantees one layout commit between the two
-    // callbacks, giving CSS transitions and font metrics time to finalize
-    // before we take the authoritative measurement.
-    let hostSyncRaf = 0;
-    const scheduleHostSync = () => {
-      if (hostSyncRaf) return;
-      hostSyncRaf = requestAnimationFrame(() => {
-        hostSyncRaf = 0;
-        syncTerminalMetrics();
-      });
-    };
-
-    let metricsDebounce: ReturnType<typeof setTimeout> | null = null;
-    const syncTerminalMetrics = () => {
-      // display:none hosts have clientWidth/Height = 0, which fit() turns
-      // into a 1x1 terminal.  Skip entirely while hidden; the visibility
-      // effect below runs another fit as soon as the tab is shown again.
-      if (!host.isConnected || host.clientWidth <= 0 || host.clientHeight <= 0) {
-        return;
-      }
-      const w = terminalTierWidthPx(host);
-      const nextSize = terminalFontSizeForWidth(w);
-      const nextLh = terminalLineHeightForWidth(w);
-      const fontChanged =
-        term.options.fontSize !== nextSize ||
-        term.options.lineHeight !== nextLh;
-      if (fontChanged) {
-        term.options.fontSize = nextSize;
-        term.options.lineHeight = nextLh;
-      }
-      try {
-        fit.fit();
-      } catch {
-        return;
-      }
-      if (fontChanged && term.rows > 0) {
-        try {
-          term.refresh(0, term.rows - 1);
-        } catch {
-          /* ignore */
-        }
-      }
-      if (
-        fontChanged &&
-        wsRef.current &&
-        wsRef.current.readyState === WebSocket.OPEN
-      ) {
-        wsRef.current.send(`\x1b[RESIZE:${term.cols};${term.rows}]`);
-      }
-    };
-    syncMetricsRef.current = syncTerminalMetrics;
-
-    const scheduleSyncTerminalMetrics = () => {
-      if (metricsDebounce) clearTimeout(metricsDebounce);
-      metricsDebounce = setTimeout(() => {
-        metricsDebounce = null;
-        syncTerminalMetrics();
-      }, 60);
-    };
-
-    const ro = new ResizeObserver(() => scheduleHostSync());
-    ro.observe(host);
-
-    window.addEventListener("resize", scheduleSyncTerminalMetrics);
-    window.visualViewport?.addEventListener("resize", scheduleSyncTerminalMetrics);
-    scheduleHostSync();
-    requestAnimationFrame(() => scheduleHostSync());
-
-    // Double-rAF authoritative fit.  On the second frame the layout has
-    // committed at least once since mount; fit.fit() then reads the
-    // stable container size.  We always send a RESIZE escape afterwards
-    // (even if fit's cols/rows didn't change, so the PTY has the same
-    // dims registered as our JS state — prevents a drift where Ink
-    // thinks the terminal is one col bigger than what's on screen).
-    let settleRaf1 = 0;
-    let settleRaf2 = 0;
-    settleRaf1 = requestAnimationFrame(() => {
-      settleRaf1 = 0;
-      settleRaf2 = requestAnimationFrame(() => {
-        settleRaf2 = 0;
-        syncTerminalMetrics();
-      });
-    });
-
-    // WebSocket
-    const url = buildWsUrl(token, resumeParam, channel);
-    const ws = new WebSocket(url);
-    ws.binaryType = "arraybuffer";
-    wsRef.current = ws;
-    // Suppress banner/terminal side-effects when cleanup() calls `ws.close()`
-    // (React StrictMode remount, route change) so we never write to a
-    // disposed xterm or setState on an unmounted tree.
-    let unmounting = false;
-
-    ws.onopen = () => {
-      setBanner(null);
-      // Send the initial RESIZE immediately so Ink has *a* size to lay
-      // out against on its first paint.  The double-rAF block above will
-      // follow up with the authoritative measurement — at worst Ink
-      // reflows once after the PTY boots, which is imperceptible.
-      ws.send(`\x1b[RESIZE:${term.cols};${term.rows}]`);
-    };
-
-    ws.onmessage = (ev) => {
-      if (typeof ev.data === "string") {
-        term.write(ev.data);
-      } else {
-        term.write(new Uint8Array(ev.data as ArrayBuffer));
-      }
-    };
-
-    ws.onclose = (ev) => {
-      wsRef.current = null;
-      if (unmounting) {
-        return;
-      }
-      if (ev.code === 4401) {
-        setBanner("Auth failed. Reload the page to refresh the session token.");
-        return;
-      }
-      if (ev.code === 4403) {
-        setBanner("Chat is only reachable from localhost.");
-        return;
-      }
-      if (ev.code === 1011) {
-        // Server already wrote an ANSI error frame.
-        return;
-      }
-      term.write("\r\n\x1b[90m[session ended]\x1b[0m\r\n");
-    };
-
-    // Keystrokes → PTY.
-    //
-    // IMPORTANT:
-    // The embedded web chat has occasionally surfaced stray letters/digits
-    // in the input line after a turn completes. The most likely culprit is
-    // browser-side terminal control traffic being forwarded back into the
-    // PTY as if it were user text. SGR mouse tracking is the highest-risk
-    // path here: xterm.js emits raw CSI reports (`\x1b[<...`) that look like
-    // ordinary bytes to the backend.
-    //
-    // For the browser embed we prefer input stability over terminal-style
-    // mouse reporting, so we drop SGR mouse reports entirely instead of
-    // forwarding them into Hermes. Keyboard input, paste, and resize still
-    // behave normally.
-    // eslint-disable-next-line no-control-regex -- intentional ESC byte in xterm SGR mouse report parser
-    const SGR_MOUSE_RE = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/;
-    const onDataDisposable = term.onData((data) => {
-      if (ws.readyState !== WebSocket.OPEN) return;
-
-      if (SGR_MOUSE_RE.test(data)) {
-        return;
-      }
-
-      ws.send(data);
-    });
-
-    const onResizeDisposable = term.onResize(({ cols, rows }) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(`\x1b[RESIZE:${cols};${rows}]`);
-      }
-    });
-
-    term.focus();
-
-    return () => {
-      unmounting = true;
-      syncMetricsRef.current = null;
-      onDataDisposable.dispose();
-      onResizeDisposable.dispose();
-      if (metricsDebounce) clearTimeout(metricsDebounce);
-      window.removeEventListener("resize", scheduleSyncTerminalMetrics);
-      window.visualViewport?.removeEventListener(
-        "resize",
-        scheduleSyncTerminalMetrics,
-      );
-      ro.disconnect();
-      if (hostSyncRaf) cancelAnimationFrame(hostSyncRaf);
-      if (settleRaf1) cancelAnimationFrame(settleRaf1);
-      if (settleRaf2) cancelAnimationFrame(settleRaf2);
-      ws.close();
-      wsRef.current = null;
-      term.dispose();
-      termRef.current = null;
-      fitRef.current = null;
-      if (copyResetRef.current) {
-        clearTimeout(copyResetRef.current);
-        copyResetRef.current = null;
-      }
-    };
-  }, [channel, resumeParam]);
-
-  // When the user returns to the chat tab (isActive: false → true), the
-  // terminal host just transitioned from display:none to display:flex.
-  // ResizeObserver won't fire on that kind of style-driven box change —
-  // xterm thinks its grid is still whatever it was when the tab was
-  // hidden (or 0×0, if it was hidden before first fit).  Force a refit
-  // after two animation frames so layout has committed.
-  //
-  // Focus handling: we only steal focus back into the terminal when
-  // nothing else inside ChatPage was holding it (typically the first
-  // activation after mount, where document.activeElement is <body>; or
-  // a return after the user had been typing in the terminal, where
-  // focus was already on the xterm textarea before the tab got hidden
-  // and has since fallen back to <body>).  If the user had clicked
-  // into the sidebar (model picker, tool-call entry) before switching
-  // tabs, we must not yank focus away from wherever they left it when
-  // they come back — that's a surprise and an a11y foot-gun.
-  useEffect(() => {
-    if (!isActive) return;
-    let raf1 = 0;
-    let raf2 = 0;
-    raf1 = requestAnimationFrame(() => {
-      raf1 = 0;
-      raf2 = requestAnimationFrame(() => {
-        raf2 = 0;
-        syncMetricsRef.current?.();
-        const host = hostRef.current;
-        const active = typeof document !== "undefined"
-          ? document.activeElement
-          : null;
-        const focusIsElsewhereInChatPage =
-          active !== null &&
-          active !== document.body &&
-          host !== null &&
-          !host.contains(active);
-        if (!focusIsElsewhereInChatPage) {
-          termRef.current?.focus();
-        }
-      });
-    });
-    return () => {
-      if (raf1) cancelAnimationFrame(raf1);
-      if (raf2) cancelAnimationFrame(raf2);
-    };
-  }, [isActive]);
-
-  // Layout:
-  //   outer flex column — sits inside the dashboard's content area
-  //   row split — terminal pane (flex-1) + sidebar (fixed width, lg+)
-  //   terminal wrapper — rounded, dark, padded — the "terminal window"
-  //   floating copy button — bottom-right corner, transparent with a
-  //     subtle border; stays out of the way until hovered.  Sends
-  //     `/copy\n` to Ink, which emits OSC 52 → our clipboard handler.
-  //   sidebar — ChatSidebar opens its own JSON-RPC sidecar; renders
-  //     model badge, tool-call list, model picker. Best-effort: if the
-  //     sidecar fails to connect the terminal pane keeps working.
-  //
-  // `normal-case` opts out of the dashboard's global `uppercase` rule on
-  // the root `<div>` in App.tsx — terminal output must preserve case.
-  //
-  // Mobile model/tools sheet is portaled to `document.body` so it stacks
-  // above the app sidebar (`z-50`) and mobile chrome (`z-40`).  The main
-  // dashboard column uses `relative z-2`, which traps `position:fixed`
-  // descendants below those layers (see Toast.tsx).
-  const mobileModelToolsPortal =
-    isActive &&
-    narrow &&
-    portalRoot &&
-    createPortal(
-      <>
-        {mobilePanelOpen && (
-          <Button
-            ghost
-            aria-label={t.app.closeModelTools}
-            onClick={closeMobilePanel}
-            className={cn(
-              "fixed inset-0 z-[55] p-0 block",
-              "bg-black/60 backdrop-blur-sm",
-            )}
-          />
-        )}
-
-        <div
-          id="chat-side-panel"
-          role="complementary"
-          aria-label={modelToolsLabel}
-          className={cn(
-            "font-mondwest fixed top-0 right-0 z-[60] flex h-dvh max-h-dvh w-64 min-w-0 flex-col antialiased",
-            "border-l border-current/20 text-midground",
-            "bg-background-base/95 backdrop-blur-sm",
-            "transition-transform duration-200 ease-out",
-            "[background:var(--component-sidebar-background)]",
-            "[clip-path:var(--component-sidebar-clip-path)]",
-            "[border-image:var(--component-sidebar-border-image)]",
-            mobilePanelOpen
-              ? "translate-x-0"
-              : "pointer-events-none translate-x-full",
-          )}
-        >
-          <div
-            className={cn(
-              "flex h-14 shrink-0 items-center justify-between gap-2 border-b border-current/20 px-5",
-            )}
+  if (status === "error") {
+    return (
+      <span className="inline-flex items-center gap-2 text-[13px] text-red-500">
+        <span>{errorText}</span>
+        {onRetry && (
+          <button
+            type="button"
+            onClick={onRetry}
+            className="inline-flex items-center gap-1 underline-offset-2 hover:underline"
           >
-            <Typography
-              className="font-bold text-[1.125rem] leading-[0.95] tracking-[0.0525rem] text-midground"
-              style={{ mixBlendMode: "plus-lighter" }}
-            >
-              {t.app.modelToolsSheetTitle}
-              <br />
-              {t.app.modelToolsSheetSubtitle}
-            </Typography>
-
-            <Button
-              ghost
-              size="icon"
-              onClick={closeMobilePanel}
-              aria-label={t.app.closeModelTools}
-              className="text-midground/70 hover:text-midground"
-            >
-              <X />
-            </Button>
-          </div>
-
-          <div
-            className={cn(
-              "min-h-0 flex-1 overflow-y-auto overflow-x-hidden",
-              "border-t border-current/10",
-            )}
-          >
-            <ChatSidebar channel={channel} />
-          </div>
-        </div>
-      </>,
-      portalRoot,
+            <RotateCw className="h-3 w-3" /> Retry
+          </button>
+        )}
+      </span>
     );
+  }
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-2 normal-case">
-      <PluginSlot name="chat:top" />
-      {mobileModelToolsPortal}
+    <div className="relative inline-block" ref={ref}>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-label={ariaLabel}
+        className={cn(
+          "inline-flex items-center gap-1 rounded px-1.5 py-0.5",
+          "text-[13px] font-normal text-[#1a1a1a] transition-colors",
+          "hover:bg-[#e8e8e8] focus:outline-none focus:ring-1 focus:ring-[#bdbdbd]",
+        )}
+      >
+        <span className="max-w-[220px] truncate">{selectedLabel}</span>
+        <ChevronDown
+          className={cn(
+            "h-3.5 w-3.5 text-[#666] transition-transform",
+            open && "rotate-180",
+          )}
+        />
+      </button>
 
-      {banner && (
-        <div className="border border-warning/50 bg-warning/10 text-warning px-3 py-2 text-xs tracking-wide">
-          {banner}
+      {open && (
+        <div
+          role="listbox"
+          className="absolute left-0 z-30 mt-1 max-h-72 overflow-auto rounded-lg border border-[#e0e0e0] bg-white py-1 shadow-lg"
+          style={{ minWidth: menuMinWidth }}
+        >
+          {items.length === 0 ? (
+            <div className="px-3 py-2 text-[13px] text-[#999]">
+              {emptyText}
+            </div>
+          ) : (
+            items.map((item) => (
+              <button
+                key={itemKey(item)}
+                type="button"
+                role="option"
+                onClick={() => {
+                  onSelect(item);
+                  setOpen(false);
+                }}
+                className="flex w-full flex-col items-start gap-0.5 px-3 py-1.5 text-left text-[13px] text-[#1a1a1a] transition-colors hover:bg-[#f5f5f5]"
+              >
+                <span>{itemLabel(item)}</span>
+                {itemSecondary?.(item) && (
+                  <span className="text-[11px] text-[#999]">
+                    {itemSecondary(item)}
+                  </span>
+                )}
+              </button>
+            ))
+          )}
         </div>
       )}
-
-      <div className="flex min-h-0 flex-1 flex-col gap-2 lg:flex-row lg:gap-3">
-        <div
-          className={cn(
-            "relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-lg",
-            "p-2 sm:p-3",
-          )}
-          style={{
-            backgroundColor: TERMINAL_THEME.background,
-            boxShadow: "0 8px 32px rgba(0, 0, 0, 0.4)",
-          }}
-        >
-          <div
-            ref={hostRef}
-            className="hermes-chat-xterm-host min-h-0 min-w-0 flex-1"
-          />
-
-          <Button
-            ghost
-            onClick={handleCopyLast}
-            title="Copy last assistant response as raw markdown"
-            aria-label="Copy last assistant response"
-            className={cn(
-              "absolute z-10",
-              "rounded border border-current/30",
-              "bg-black/20 backdrop-blur-sm",
-              "opacity-60 hover:opacity-100 hover:border-current/60",
-              "transition-opacity duration-150 normal-case font-normal tracking-normal",
-              "bottom-2 right-2 px-2 py-1 text-[0.65rem] sm:bottom-3 sm:right-3 sm:px-2.5 sm:py-1.5 sm:text-xs",
-              "lg:bottom-4 lg:right-4",
-            )}
-            style={{ color: TERMINAL_THEME.foreground }}
-          >
-            <span className="inline-flex items-center gap-1.5">
-              <Copy className="h-3 w-3 shrink-0" />
-              <span className="hidden min-[400px]:inline tracking-wide">
-                {copyState === "copied" ? "copied" : "copy last response"}
-              </span>
-            </span>
-          </Button>
-        </div>
-
-        {!narrow && (
-          <div
-            id="chat-side-panel"
-            role="complementary"
-            aria-label={modelToolsLabel}
-            className="flex min-h-0 shrink-0 flex-col overflow-hidden lg:h-full lg:w-80"
-          >
-            <div className="min-h-0 flex-1 overflow-hidden">
-              <ChatSidebar channel={channel} />
-            </div>
-          </div>
-        )}
-      </div>
-      <PluginSlot name="chat:bottom" />
     </div>
   );
 }
 
-declare global {
-  interface Window {
-    __HERMES_SESSION_TOKEN__?: string;
+// ============================================================
+// AgentSidebar — Cursor-style left panel with New Agent button,
+// collapsible Cursor/Hermes groups, and noise-filtered list.
+// ============================================================
+
+function AgentSidebar() {
+  const [newAgentOpen, setNewAgentOpen] = useState(false);
+  const [search, setSearch] = useState("");
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const newAgentRef = useRef<HTMLDivElement>(null);
+  useClickOutside(newAgentRef, () => setNewAgentOpen(false));
+
+  const toggleGroup = (label: string) => {
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      if (next.has(label)) next.delete(label);
+      else next.add(label);
+      return next;
+    });
+  };
+
+  const filtered = useMemo(() => {
+    const q = search.toLowerCase().trim();
+    return MOCK_AGENTS
+      .map((g) => ({
+        ...g,
+        conversations: g.conversations.filter((c) => {
+          // Filter system noise
+          if (c.title === "Untitled") return false;
+          if (/^\d{8}_/.test(c.title)) return false;
+          // Search filter
+          if (!q) return true;
+          return (
+            c.title.toLowerCase().includes(q) ||
+            (c.branchName ?? "").toLowerCase().includes(q)
+          );
+        }),
+      }))
+      .filter((g) => g.conversations.length > 0);
+  }, [search]);
+
+  return (
+    <aside
+      className="flex w-[260px] shrink-0 flex-col border-r border-[#e0e0e0]"
+      style={{ backgroundColor: "#f8f8f8" }}
+    >
+      {/* ---- New Agent button ---- */}
+      <div className="p-3" ref={newAgentRef}>
+        <div className="relative">
+          <button
+            type="button"
+            onClick={() => setNewAgentOpen((v) => !v)}
+            className={cn(
+              "flex w-full items-center justify-between rounded-lg",
+              "px-3.5 py-2 text-[13px] font-semibold text-[#1a1a1a]",
+              "transition-colors",
+              "bg-[#eaeaea] hover:bg-[#e0e0e0]",
+            )}
+          >
+            <span>New Agent</span>
+            <ChevronDown
+              className={cn(
+                "h-3.5 w-3.5 text-[#666] transition-transform",
+                newAgentOpen && "rotate-180",
+              )}
+            />
+          </button>
+
+          {newAgentOpen && (
+            <div className="absolute left-0 right-0 z-30 mt-1 rounded-lg border border-[#e0e0e0] bg-white py-1 shadow-lg">
+              <button
+                type="button"
+                className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13px] text-[#1a1a1a] transition-colors hover:bg-[#f5f5f5]"
+                onClick={() => {
+                  console.info("[ChatPage] New Cursor Agent");
+                  setNewAgentOpen(false);
+                }}
+              >
+                <span className="text-[#3b82f6]">✦</span>
+                New Cursor Agent
+              </button>
+              <button
+                type="button"
+                className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13px] text-[#1a1a1a] transition-colors hover:bg-[#f5f5f5]"
+                onClick={() => {
+                  console.info("[ChatPage] New Hermes Agent");
+                  setNewAgentOpen(false);
+                }}
+              >
+                <span className="text-[#22c55e]">✦</span>
+                New Hermes Agent
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ---- Search ---- */}
+      <div className="px-3 pb-2">
+        <div className="relative">
+          <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-[#999]" />
+          <input
+            type="text"
+            placeholder="Search conversations..."
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            className="w-full h-8 pl-8 pr-3 text-[12px] border border-[#e0e0e0] rounded outline-none focus:border-[#bdbdbd] transition-colors bg-white"
+          />
+        </div>
+      </div>
+
+      {/* ---- Collapsible groups ---- */}
+      <div className="flex-1 overflow-y-auto">
+        {filtered.length === 0 ? (
+          <div className="flex items-center justify-center h-full text-[12px] text-[#999] px-4 text-center">
+            No conversations found.
+          </div>
+        ) : (
+          <div className="py-1">
+            {filtered.map((group) => {
+              const isCollapsed = collapsed.has(group.label);
+              return (
+                <div key={group.label}>
+                  {/* Group header */}
+                  <button
+                    onClick={() => toggleGroup(group.label)}
+                    className={cn(
+                      "flex items-center gap-1.5 w-full px-3 py-2",
+                      "text-[11px] font-semibold text-[#1a1a1a]",
+                      "hover:bg-[#eaeaea] transition-colors",
+                      "tracking-wider uppercase",
+                    )}
+                  >
+                    {isCollapsed ? (
+                      <ChevronRight className="h-3 w-3 text-[#999]" />
+                    ) : (
+                      <ChevronDown className="h-3 w-3 text-[#999]" />
+                    )}
+                    <Folder className="h-3.5 w-3.5 text-[#666]" />
+                    <span className="truncate">{group.label}</span>
+                  </button>
+
+                  {/* Conversation items */}
+                  {!isCollapsed && (
+                    <div>
+                      {group.conversations.map((conv) => (
+                        <button
+                          key={conv.id}
+                          onClick={() =>
+                            console.info("[ChatPage] select conversation", conv.id)
+                          }
+                          className={cn(
+                            "flex items-center gap-2 w-full px-3 py-1.5 text-[12px] transition-colors",
+                            "hover:bg-[#eaeaea]",
+                          )}
+                        >
+                          <GitBranch className="h-3.5 w-3.5 shrink-0 text-[#666]" />
+                          <span className="truncate flex-1 text-left text-[#1a1a1a]">
+                            {conv.title}
+                          </span>
+                          <span className="shrink-0 text-[11px] space-x-1">
+                            {conv.additions > 0 && (
+                              <span className="text-[#22c55e]">
+                                +{conv.additions}
+                              </span>
+                            )}
+                            {conv.deletions > 0 && (
+                              <span className="text-[#ef4444]">
+                                -{conv.deletions}
+                              </span>
+                            )}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* ---- User info footer ---- */}
+      <div className="flex items-center gap-2.5 px-3 py-2.5 border-t border-[#e0e0e0]">
+        <div className="h-6 w-6 rounded-full bg-[#3b82f6] flex items-center justify-center text-white text-[11px] font-semibold shrink-0">
+          W
+        </div>
+        <span className="text-[12px] font-medium text-[#1a1a1a]">Wei Lin</span>
+        <span className="ml-auto text-[10px] font-medium text-[#666] bg-[#eaeaea] rounded px-1.5 py-0.5">
+          Ultra
+        </span>
+      </div>
+    </aside>
+  );
+}
+
+// ============================================================
+// QuickButton — pill-style preset action
+// ============================================================
+
+function QuickButton({
+  label,
+  suffix,
+  onClick,
+}: {
+  label: string;
+  suffix?: string;
+  onClick?: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        "inline-flex items-center gap-2 rounded-full border border-[#e0e0e0]",
+        "bg-white px-3.5 py-1.5 text-[13px] text-[#666] transition-all",
+        "hover:border-[#bdbdbd] hover:bg-[#fafafa] hover:shadow-sm",
+      )}
+    >
+      <span>{label}</span>
+      {suffix && (
+        <span className="inline-flex items-center rounded border border-[#e0e0e0] px-1.5 py-0.5 font-mono text-[11px] text-[#999]">
+          {suffix}
+        </span>
+      )}
+    </button>
+  );
+}
+
+// ============================================================
+// RecentActivityList & Card
+// ============================================================
+
+const STATUS_META: Record<
+  ActivityStatus,
+  { icon: ComponentType<{ className?: string }>; color: string; bg: string }
+> = {
+  draft: { icon: FileText, color: "#666", bg: "#e8e8e8" },
+  branch: { icon: GitBranch, color: "#3b82f6", bg: "#dbeafe" },
+  running: { icon: PlayCircle, color: "#eab308", bg: "#fef9c3" },
+  completed: { icon: CheckCircle2, color: "#22c55e", bg: "#dcfce7" },
+  failed: { icon: XCircle, color: "#ef4444", bg: "#fee2e2" },
+};
+
+function RecentActivityCard({
+  activity,
+  onClick,
+}: {
+  activity: Activity;
+  onClick?: (activity: Activity) => void;
+}) {
+  const meta = STATUS_META[activity.status];
+  const Icon = meta.icon;
+  return (
+    <button
+      type="button"
+      onClick={() => onClick?.(activity)}
+      className={cn(
+        "flex w-full items-start gap-3 rounded-lg border border-[#e0e0e0] bg-white px-4 py-3 text-left",
+        "transition-all hover:border-[#bdbdbd] hover:shadow-sm",
+      )}
+    >
+      <span
+        className="mt-0.5 inline-flex shrink-0 items-center gap-1 rounded px-2 py-1 text-[11px] font-medium"
+        style={{ backgroundColor: meta.bg, color: meta.color }}
+      >
+        <Icon className="h-3 w-3" />
+        <span>{activity.statusLabel}</span>
+      </span>
+
+      <div className="flex min-w-0 flex-1 flex-col gap-1">
+        <span className="truncate text-[14px] font-semibold text-[#1a1a1a]">
+          {activity.title}
+        </span>
+        <span className="text-[12px] text-[#666]">
+          {activity.modelName}
+        </span>
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[12px] text-[#999]">
+          <span className="inline-flex items-center gap-1">
+            <Clock className="h-3 w-3" />
+            {activity.timestamp}
+          </span>
+          <span aria-hidden>·</span>
+          <span className="truncate">{activity.repoName}</span>
+          {(activity.additions !== undefined ||
+            activity.deletions !== undefined) && (
+            <>
+              <span aria-hidden>·</span>
+              <span className="inline-flex items-center gap-2 font-mono text-[11px]">
+                {activity.additions !== undefined && (
+                  <span className="text-green-500">+{activity.additions}</span>
+                )}
+                {activity.deletions !== undefined && (
+                  <span className="text-red-500">-{activity.deletions}</span>
+                )}
+              </span>
+            </>
+          )}
+        </div>
+      </div>
+    </button>
+  );
+}
+
+function RecentActivityList({
+  status,
+  activities,
+  onRetry,
+  onCardClick,
+}: {
+  status: DataStatus;
+  activities: Activity[];
+  onRetry?: () => void;
+  onCardClick?: (activity: Activity) => void;
+}) {
+  if (status === "loading") {
+    return (
+      <div className="flex flex-col gap-3" aria-busy="true">
+        {[0, 1, 2].map((i) => (
+          <div
+            key={i}
+            className="h-20 animate-pulse rounded-lg border border-[#e0e0e0] bg-white"
+          />
+        ))}
+      </div>
+    );
   }
+
+  if (status === "error") {
+    return (
+      <div
+        role="alert"
+        className="flex flex-col items-center justify-center gap-2 rounded-lg border border-[#e0e0e0] bg-white py-8 text-[13px] text-red-500"
+      >
+        <span>Failed to load recent activity.</span>
+        {onRetry && (
+          <button
+            type="button"
+            onClick={onRetry}
+            className="inline-flex items-center gap-1.5 rounded px-3 py-1 text-[12px] text-blue-500 transition-colors hover:underline"
+          >
+            <RotateCw className="h-3 w-3" /> Retry
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  if (activities.length === 0) {
+    return (
+      <div className="rounded-lg border border-[#e0e0e0] bg-white px-6 py-10 text-center text-[13px] text-[#999]">
+        No recent activity. Start a new task above.
+      </div>
+    );
+  }
+
+  return (
+    <ul className="flex flex-col gap-3">
+      {activities.map((a) => (
+        <li key={a.id}>
+          <RecentActivityCard activity={a} onClick={onCardClick} />
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+// ============================================================
+// ChatPage — page entry point
+// ============================================================
+
+// `isActive` accepted to preserve App.tsx's call signature; the new
+// page is stateless w.r.t. activation (no PTY to suspend), so we
+// don't read it.
+export default function ChatPage(_props: { isActive?: boolean } = {}) {
+  // Repos
+  const [reposStatus, setReposStatus] = useState<DataStatus>("loading");
+  const [repos, setRepos] = useState<Repo[]>([]);
+  const [selectedRepo, setSelectedRepo] = useState<Repo | null>(null);
+
+  // Branches (depend on selectedRepo)
+  const [branchesStatus, setBranchesStatus] = useState<DataStatus>("loading");
+  const [branches, setBranches] = useState<string[]>([]);
+  const [selectedBranch, setSelectedBranch] = useState<string>("");
+
+  // Models
+  const [modelsStatus, setModelsStatus] = useState<DataStatus>("loading");
+  const [models, setModels] = useState<Model[]>([]);
+  const [selectedModel, setSelectedModel] = useState<Model | null>(null);
+
+  // Recent activity
+  const [activitiesStatus, setActivitiesStatus] = useState<DataStatus>("loading");
+  const [activities, setActivities] = useState<Activity[]>([]);
+
+  // Instruction input
+  const [instruction, setInstruction] = useState("");
+
+  // MCPs dropdown
+  const mcpsRef = useRef<HTMLDivElement>(null);
+  const [mcpsOpen, setMcpsOpen] = useState(false);
+  useClickOutside(mcpsRef, () => setMcpsOpen(false));
+
+  // Mock fetchers — small setTimeout to exercise the loading state
+  const loadRepos = useCallback(() => {
+    setReposStatus("loading");
+    const t = setTimeout(() => {
+      setRepos(MOCK_REPOS);
+      setSelectedRepo(MOCK_REPOS[0] ?? null);
+      setReposStatus("ready");
+    }, 200);
+    return () => clearTimeout(t);
+  }, []);
+
+  const loadBranches = useCallback((_repoId: string) => {
+    setBranchesStatus("loading");
+    const t = setTimeout(() => {
+      setBranches(MOCK_BRANCHES);
+      setSelectedBranch(MOCK_BRANCHES[0] ?? "");
+      setBranchesStatus("ready");
+    }, 150);
+    return () => clearTimeout(t);
+  }, []);
+
+  const loadModels = useCallback(() => {
+    setModelsStatus("loading");
+    const t = setTimeout(() => {
+      setModels(MOCK_MODELS);
+      setSelectedModel(MOCK_MODELS.find((m) => m.isDefault) ?? MOCK_MODELS[0] ?? null);
+      setModelsStatus("ready");
+    }, 220);
+    return () => clearTimeout(t);
+  }, []);
+
+  const loadActivities = useCallback(() => {
+    setActivitiesStatus("loading");
+    const t = setTimeout(() => {
+      setActivities(MOCK_ACTIVITIES);
+      setActivitiesStatus("ready");
+    }, 280);
+    return () => clearTimeout(t);
+  }, []);
+
+  useEffect(() => {
+    const cleanups = [loadRepos(), loadModels(), loadActivities()];
+    return () => cleanups.forEach((c) => c?.());
+  }, [loadRepos, loadModels, loadActivities]);
+
+  useEffect(() => {
+    if (!selectedRepo) return;
+    return loadBranches(selectedRepo.id);
+  }, [selectedRepo, loadBranches]);
+
+  const handleSubmit = useCallback(() => {
+    if (!instruction.trim()) return;
+    // TODO: POST /api/chat then navigate to /sessions?id=<new>
+    console.info("[ChatPage] submit", {
+      instruction,
+      repo: selectedRepo?.fullName ?? selectedRepo?.name,
+      branch: selectedBranch,
+      model: selectedModel?.id,
+    });
+  }, [instruction, selectedRepo, selectedBranch, selectedModel]);
+
+  const handleKeyDown = useCallback(
+    (e: KeyboardEvent<HTMLTextAreaElement>) => {
+      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        handleSubmit();
+      }
+    },
+    [handleSubmit],
+  );
+
+  return (
+    <div
+      className="flex min-h-0 flex-1 flex-col font-sans normal-case antialiased"
+      style={{ backgroundColor: "#f5f5f5", color: "#1a1a1a" }}
+    >
+      <PluginSlot name="chat:top" />
+
+      <div className="flex min-h-0 flex-1">
+        {/* ---- Cursor-style left sidebar ---- */}
+        <AgentSidebar />
+
+        {/* ---- Main content area ---- */}
+        <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
+          <div className="mx-auto flex w-full max-w-3xl flex-col gap-6 px-4 py-8 sm:px-6 sm:py-10">
+            {/* 1. Repo / Branch selectors */}
+            <header className="flex flex-wrap items-center gap-x-2 gap-y-2 text-[13px]">
+              <InlineDropdown<Repo>
+                ariaLabel="Repository"
+                selectedLabel={selectedRepo?.name ?? "Select repo"}
+                items={repos}
+                itemKey={(r) => r.id}
+                itemLabel={(r) => r.name}
+                itemSecondary={(r) => r.fullName}
+                onSelect={(r) => setSelectedRepo(r)}
+                status={reposStatus}
+                emptyText="No repositories found."
+                errorText="Failed to load repos."
+                onRetry={loadRepos}
+                skeletonWidth={160}
+                menuMinWidth={260}
+              />
+              <span aria-hidden className="text-[#999]">/</span>
+              <div className="inline-flex items-center gap-1">
+                <GitBranch
+                  className="h-3.5 w-3.5 text-[#666]"
+                  aria-hidden
+                />
+                <InlineDropdown<string>
+                  ariaLabel="Branch"
+                  selectedLabel={selectedBranch || "Select branch"}
+                  items={branches}
+                  itemKey={(b) => b}
+                  itemLabel={(b) => b}
+                  onSelect={(b) => setSelectedBranch(b)}
+                  status={branchesStatus}
+                  emptyText="No branches found."
+                  errorText="Failed to load branches."
+                  onRetry={() => selectedRepo && loadBranches(selectedRepo.id)}
+                  skeletonWidth={120}
+                  menuMinWidth={220}
+                />
+              </div>
+            </header>
+
+            {/* 2. Large instruction input */}
+            <section
+              className="relative rounded-xl border border-[#e0e0e0] bg-white transition-all focus-within:border-[#bdbdbd] focus-within:shadow-sm"
+            >
+              <label htmlFor="chat-instruction" className="sr-only">
+                Instruction
+              </label>
+              <textarea
+                id="chat-instruction"
+                value={instruction}
+                onChange={(e) => setInstruction(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder="Ask Cursor to build, fix bugs, explore"
+                rows={4}
+                className={cn(
+                  "block w-full resize-none rounded-xl bg-transparent",
+                  "px-4 py-3 pr-24 text-[14px] leading-relaxed",
+                  "placeholder:text-[#999] focus:outline-none",
+                  "text-[#1a1a1a]",
+                )}
+                style={{ minHeight: 120 }}
+              />
+              <div className="absolute bottom-3 right-3 flex items-center gap-1">
+                <button
+                  type="button"
+                  aria-label="Attach image"
+                  title="Attach image"
+                  className="rounded p-1.5 text-[#999] transition-colors hover:bg-[#f0f0f0]"
+                >
+                  <ImageIcon className="h-4 w-4" />
+                </button>
+                <button
+                  type="button"
+                  aria-label="Voice input"
+                  title="Voice input"
+                  className="rounded p-1.5 text-[#999] transition-colors hover:bg-[#f0f0f0]"
+                >
+                  <Mic className="h-4 w-4" />
+                </button>
+              </div>
+            </section>
+
+            {/* 3. Model selector + MCPs */}
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+              <InlineDropdown<Model>
+                ariaLabel="Model"
+                selectedLabel={selectedModel?.name ?? "Select model"}
+                items={models}
+                itemKey={(m) => m.id}
+                itemLabel={(m) => m.name}
+                itemSecondary={(m) => m.provider}
+                onSelect={(m) => setSelectedModel(m)}
+                status={modelsStatus}
+                emptyText="No models available."
+                errorText="Failed to load models."
+                onRetry={loadModels}
+                skeletonWidth={140}
+                menuMinWidth={220}
+              />
+              <div className="relative inline-block" ref={mcpsRef}>
+                <button
+                  type="button"
+                  onClick={() => setMcpsOpen((v) => !v)}
+                  aria-haspopup="listbox"
+                  aria-expanded={mcpsOpen}
+                  className={cn(
+                    "inline-flex items-center gap-1 rounded px-1.5 py-0.5",
+                    "text-[13px] font-normal text-[#1a1a1a] transition-colors",
+                    "hover:bg-[#e8e8e8] focus:outline-none focus:ring-1 focus:ring-[#bdbdbd]",
+                  )}
+                >
+                  <span>MCPs</span>
+                  <ChevronDown
+                    className={cn(
+                      "h-3.5 w-3.5 text-[#666] transition-transform",
+                      mcpsOpen && "rotate-180",
+                    )}
+                  />
+                </button>
+                {mcpsOpen && (
+                  <div className="absolute left-0 z-30 mt-1 w-56 rounded-lg border border-[#e0e0e0] bg-white p-3 text-[12px] text-[#666] shadow-lg">
+                    No MCP servers configured.
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* 4. Quick action buttons */}
+            <div className="flex flex-wrap gap-3">
+              <QuickButton
+                label="Try Commands"
+                suffix="Press /"
+                onClick={() => setInstruction((prev) => (prev ? prev : "/"))}
+              />
+              <QuickButton
+                label="Run security audit"
+                onClick={() =>
+                  setInstruction(
+                    "Run a security audit on the current branch and report all critical issues with file references.",
+                  )
+                }
+              />
+            </div>
+
+            {/* 5. Recent activity */}
+            <section className="mt-2 flex flex-col gap-3">
+              <h2 className="text-[11px] font-semibold tracking-[0.08em] text-[#666]">
+                RECENT ACTIVITY
+              </h2>
+              <RecentActivityList
+                status={activitiesStatus}
+                activities={activities}
+                onRetry={loadActivities}
+                onCardClick={(a) =>
+                  console.info("[ChatPage] open activity", a.id)
+                }
+              />
+            </section>
+          </div>
+        </div>
+      </div>
+
+      <PluginSlot name="chat:bottom" />
+    </div>
+  );
 }
